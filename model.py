@@ -209,13 +209,12 @@ class RoPEMultiheadAttention(nn.Module):
             # key_padding_mask: (B, Lk), True = padding
             # SDPA expects (B, 1, 1, Lk) bool mask, True = attend
             sdpa_attn_mask = ~key_padding_mask.unsqueeze(1).unsqueeze(2)  # (B, 1, 1, Lk)
-            sdpa_attn_mask = sdpa_attn_mask.expand(B, self.num_heads, Lq, Lk)
 
         if attn_mask is not None:
             # attn_mask: additive float mask (Lq, Lk), -inf means do not attend
             # Convert to bool: positions that are not -inf are True
             bool_attn = (attn_mask == 0)  # (Lq, Lk)
-            bool_attn = bool_attn.unsqueeze(0).unsqueeze(0).expand(B, self.num_heads, Lq, Lk)
+            bool_attn = bool_attn.unsqueeze(0).unsqueeze(0)  # (1, 1, Lq, Lk)
             if sdpa_attn_mask is not None:
                 sdpa_attn_mask = sdpa_attn_mask & bool_attn
             else:
@@ -995,12 +994,14 @@ class GroupNSTokenizer(nn.Module):
 
     def __init__(self, feature_specs: List[Tuple[int, int, int]],
                  groups: List[List[int]], emb_dim: int, d_model: int,
-                 emb_skip_threshold: int = 0) -> None:
+                 emb_skip_threshold: int = 0,
+                 sparse_embeddings: bool = False) -> None:
         super().__init__()
         self.feature_specs = feature_specs
         self.groups = groups
         self.emb_dim = emb_dim
         self.emb_skip_threshold = emb_skip_threshold
+        self.sparse_embeddings = sparse_embeddings
 
         # One embedding table per fid (None if skipped by emb_skip_threshold
         # or if vocab_size <= 0 / no vocab info).
@@ -1010,7 +1011,10 @@ class GroupNSTokenizer(nn.Module):
             if skip:
                 embs.append(None)
             else:
-                embs.append(nn.Embedding(int(vs) + 1, emb_dim, padding_idx=0))
+                embs.append(nn.Embedding(
+                    int(vs) + 1, emb_dim, padding_idx=0,
+                    sparse=sparse_embeddings,
+                ))
         self.embs = nn.ModuleList([e for e in embs if e is not None])
         # Map from fid index to position in self.embs (or -1 if filtered)
         self._emb_index = []
@@ -1083,6 +1087,7 @@ class RankMixerNSTokenizer(nn.Module):
         d_model: int,
         num_ns_tokens: int,
         emb_skip_threshold: int = 0,
+        sparse_embeddings: bool = False,
     ) -> None:
         """Initializes RankMixerNSTokenizer.
 
@@ -1100,6 +1105,7 @@ class RankMixerNSTokenizer(nn.Module):
         self.emb_dim = emb_dim
         self.num_ns_tokens = num_ns_tokens
         self.emb_skip_threshold = emb_skip_threshold
+        self.sparse_embeddings = sparse_embeddings
 
         # One embedding table per fid (None if skipped by emb_skip_threshold
         # or if vocab_size <= 0 / no vocab info).
@@ -1109,7 +1115,10 @@ class RankMixerNSTokenizer(nn.Module):
             if skip:
                 embs.append(None)
             else:
-                embs.append(nn.Embedding(int(vs) + 1, emb_dim, padding_idx=0))
+                embs.append(nn.Embedding(
+                    int(vs) + 1, emb_dim, padding_idx=0,
+                    sparse=sparse_embeddings,
+                ))
         self.embs = nn.ModuleList([e for e in embs if e is not None])
         # Map from fid index to position in self.embs (or -1 if filtered)
         self._emb_index = []
@@ -1229,6 +1238,7 @@ class PCVRHyFormer(nn.Module):
         ns_tokenizer_type: str = 'rankmixer',
         user_ns_tokens: int = 0,
         item_ns_tokens: int = 0,
+        sparse_embeddings: bool = False,
     ) -> None:
         super().__init__()
 
@@ -1244,6 +1254,7 @@ class PCVRHyFormer(nn.Module):
         self.emb_skip_threshold = emb_skip_threshold
         self.seq_id_threshold = seq_id_threshold
         self.ns_tokenizer_type = ns_tokenizer_type
+        self.sparse_embeddings = sparse_embeddings
 
         # ================== NS Tokens Construction ==================
 
@@ -1255,6 +1266,7 @@ class PCVRHyFormer(nn.Module):
                 emb_dim=emb_dim,
                 d_model=d_model,
                 emb_skip_threshold=emb_skip_threshold,
+                sparse_embeddings=sparse_embeddings,
             )
             num_user_ns = len(user_ns_groups)
 
@@ -1264,6 +1276,7 @@ class PCVRHyFormer(nn.Module):
                 emb_dim=emb_dim,
                 d_model=d_model,
                 emb_skip_threshold=emb_skip_threshold,
+                sparse_embeddings=sparse_embeddings,
             )
             num_item_ns = len(item_ns_groups)
         elif ns_tokenizer_type == 'rankmixer':
@@ -1280,6 +1293,7 @@ class PCVRHyFormer(nn.Module):
                 d_model=d_model,
                 num_ns_tokens=user_ns_tokens,
                 emb_skip_threshold=emb_skip_threshold,
+                sparse_embeddings=sparse_embeddings,
             )
             num_user_ns = user_ns_tokens
 
@@ -1290,6 +1304,7 @@ class PCVRHyFormer(nn.Module):
                 d_model=d_model,
                 num_ns_tokens=item_ns_tokens,
                 emb_skip_threshold=emb_skip_threshold,
+                sparse_embeddings=sparse_embeddings,
             )
             num_item_ns = item_ns_tokens
         else:
@@ -1340,7 +1355,10 @@ class PCVRHyFormer(nn.Module):
                 if skip:
                     embs_raw.append(None)
                 else:
-                    embs_raw.append(nn.Embedding(int(vs) + 1, emb_dim, padding_idx=0))
+                    embs_raw.append(nn.Embedding(
+                        int(vs) + 1, emb_dim, padding_idx=0,
+                        sparse=sparse_embeddings,
+                    ))
             module_list = nn.ModuleList([e for e in embs_raw if e is not None])
             # Map from position index to real index in module_list (-1 if skipped)
             index_map = []
@@ -1375,7 +1393,10 @@ class PCVRHyFormer(nn.Module):
 
         # ================== Time Interval Bucket Embedding (optional) ==================
         if num_time_buckets > 0:
-            self.time_embedding = nn.Embedding(num_time_buckets, d_model, padding_idx=0)
+            self.time_embedding = nn.Embedding(
+                num_time_buckets, d_model, padding_idx=0,
+                sparse=sparse_embeddings,
+            )
 
         # ================== HyFormer Components ==================
         # MultiSeqQueryGenerator

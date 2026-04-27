@@ -71,12 +71,14 @@ class PCVRHyFormerRankingTrainer:
         # makes the checkpoint self-contained for evaluation environments that
         # do not ship ns_groups.json separately.
         self.ns_groups_path: Optional[str] = ns_groups_path
+        self.grad_clip_params: Optional[list[nn.Parameter]] = None
 
         # Dual optimizer: Adagrad for sparse Embeddings, AdamW for dense params.
         self.sparse_optimizer: Optional[torch.optim.Optimizer]
         if hasattr(model, 'get_sparse_params'):
             sparse_params = model.get_sparse_params()
             dense_params = model.get_dense_params()
+            self.grad_clip_params = dense_params
             sparse_param_count = sum(p.numel() for p in sparse_params)
             dense_param_count = sum(p.numel() for p in dense_params)
             logging.info(f"Sparse params: {len(sparse_params)} tensors, {sparse_param_count:,} parameters (Adagrad lr={sparse_lr})")
@@ -89,6 +91,7 @@ class PCVRHyFormerRankingTrainer:
             )
         else:
             self.sparse_optimizer = None
+            self.grad_clip_params = list(model.parameters())
             self.dense_optimizer = torch.optim.AdamW(
                 model.parameters(), lr=lr, betas=(0.9, 0.98)
             )
@@ -107,10 +110,34 @@ class PCVRHyFormerRankingTrainer:
         self.ckpt_params: Dict[str, Any] = ckpt_params or {}
         self.eval_every_n_steps: int = eval_every_n_steps
         self.train_config: Optional[Dict[str, Any]] = train_config
+        if sparse_weight_decay != 0.0 and getattr(model, 'sparse_embeddings', False):
+            raise ValueError(
+                "sparse_weight_decay must be 0.0 when sparse embedding "
+                "gradients are enabled; torch.optim.Adagrad does not support "
+                "weight decay for sparse gradients."
+            )
 
         logging.info(f"PCVRHyFormerRankingTrainer loss_type={loss_type}, "
                      f"focal_alpha={focal_alpha}, focal_gamma={focal_gamma}, "
                      f"reinit_sparse_after_epoch={reinit_sparse_after_epoch}")
+
+    def _clip_dense_grad_norm(self, max_norm: float) -> torch.Tensor:
+        """Clip only dense gradients.
+
+        Embedding tables are optimized by the sparse optimizer group and can
+        optionally produce sparse gradients. Keeping clipping on the dense
+        optimizer group avoids the slow all-embedding norm pass while still
+        covering the Transformer, FFNs, projections, and classifier.
+        """
+        dense_grad_params = [
+            p for p in (self.grad_clip_params or [])
+            if p.grad is not None and not p.grad.is_sparse
+        ]
+        if not dense_grad_params:
+            return torch.tensor(0.0, device=self.device)
+        return torch.nn.utils.clip_grad_norm_(
+            dense_grad_params, max_norm=max_norm, foreach=True
+        )
 
     def _build_step_dir_name(self, global_step: int, is_best: bool = False) -> str:
         """Build a checkpoint sub-directory name such as
@@ -404,9 +431,9 @@ class PCVRHyFormerRankingTrainer:
         device_batch = self._batch_to_device(batch)
         label = device_batch['label'].float()
 
-        self.dense_optimizer.zero_grad()
+        self.dense_optimizer.zero_grad(set_to_none=True)
         if self.sparse_optimizer is not None:
-            self.sparse_optimizer.zero_grad()
+            self.sparse_optimizer.zero_grad(set_to_none=True)
 
         model_input = self._make_model_input(device_batch)
         logits = self.model(model_input)  # (B, 1)
@@ -417,9 +444,7 @@ class PCVRHyFormerRankingTrainer:
         else:
             loss = F.binary_cross_entropy_with_logits(logits, label)
         loss.backward()
-        # foreach=False: avoids a PyTorch _foreach_norm CUDA kernel bug observed
-        # with certain tensor shapes in this project.
-        torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0, foreach=False)
+        self._clip_dense_grad_norm(max_norm=1.0)
 
         self.dense_optimizer.step()
         if self.sparse_optimizer is not None:

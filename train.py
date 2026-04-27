@@ -173,6 +173,13 @@ def parse_args() -> argparse.Namespace:
                              'extra dropout(rate*2) during training to reduce overfitting. '
                              'Features at or below this threshold are treated as side-info '
                              'and receive no extra dropout.')
+    parser.add_argument('--sparse_embedding_grads', action='store_true', default=False,
+                        help='Use sparse gradients for all Embedding tables optimized '
+                             'by Adagrad. This is opt-in because PyTorch Adagrad may '
+                             'spend significant time coalescing sparse gradients.')
+    parser.add_argument('--dense_embedding_grads', dest='sparse_embedding_grads',
+                        action='store_false',
+                        help='Use dense Embedding gradients (default).')
 
     _default_ns_groups = os.path.join(
         os.path.dirname(os.path.abspath(__file__)), 'ns_groups.json')
@@ -301,6 +308,7 @@ def main() -> None:
         "ns_tokenizer_type": args.ns_tokenizer_type,
         "user_ns_tokens": args.user_ns_tokens,
         "item_ns_tokens": args.item_ns_tokens,
+        "sparse_embeddings": args.sparse_embedding_grads,
     }
 
     model = PCVRHyFormer(**model_args).to(args.device)
