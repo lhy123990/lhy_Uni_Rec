@@ -6,7 +6,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from typing import List, NamedTuple, Tuple, Optional, Union
-
+  
 
 class ModelInput(NamedTuple):
     user_int_feats: torch.Tensor
