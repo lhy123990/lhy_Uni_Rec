@@ -5,7 +5,10 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import List, NamedTuple, Tuple, Optional, Union
+from contextlib import contextmanager
+from dataclasses import dataclass
+from typing import Callable, Iterator, List, NamedTuple, Tuple, Optional, Union
+from torch.utils.checkpoint import checkpoint
 
 
 class ModelInput(NamedTuple):
@@ -16,6 +19,18 @@ class ModelInput(NamedTuple):
     seq_data: dict        # {domain: tensor [B, S, L]}
     seq_lens: dict        # {domain: tensor [B]}
     seq_time_buckets: dict  # {domain: tensor [B, L]}
+
+
+@dataclass(frozen=True)
+class ActivationCheckpointConfig:
+    """Model-level activation checkpoint policy.
+
+    ``mode='none'`` is the default and preserves the original training path.
+    ``custom`` enables exactly the unit names listed in ``units``.
+    """
+
+    mode: str = "none"
+    units: Tuple[str, ...] = ()
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -916,6 +931,8 @@ class MultiSeqHyFormerBlock(nn.Module):
         seq_padding_masks: list,
         rope_cos_list: Optional[List[torch.Tensor]] = None,
         rope_sin_list: Optional[List[torch.Tensor]] = None,
+        checkpoint_unit_names: Optional[List[str]] = None,
+        run_unit: Optional[Callable[..., Tuple[torch.Tensor, torch.Tensor]]] = None,
     ) -> Tuple[list, torch.Tensor, list, list]:
         """Processes one multi-sequence HyFormer block step.
 
@@ -926,6 +943,11 @@ class MultiSeqHyFormerBlock(nn.Module):
             seq_padding_masks: List of (B, L_i) masks, length S.
             rope_cos_list: List of (1, L_i, head_dim) tensors, length S.
             rope_sin_list: List of (1, L_i, head_dim) tensors, length S.
+            checkpoint_unit_names: Optional stable names for per-sequence encoder
+                checkpoint/trace units.
+            run_unit: Optional wrapper supplied by the parent model. It traces
+                candidate units and applies activation checkpointing when the
+                configured policy selects a unit.
 
         Returns:
             A tuple (next_q_list, next_ns, next_seq_list, next_masks), where
@@ -943,10 +965,35 @@ class MultiSeqHyFormerBlock(nn.Module):
         for i in range(S):
             rc = rope_cos_list[i] if rope_cos_list is not None else None
             rs = rope_sin_list[i] if rope_sin_list is not None else None
-            result = self.seq_encoders[i](
-                seq_tokens_list[i], seq_padding_masks[i],
-                rope_cos=rc, rope_sin=rs,
-            )
+            unit_name = checkpoint_unit_names[i] if checkpoint_unit_names else None
+
+            def _encode(*args):
+                if rc is None or rs is None:
+                    seq_i, mask_i_arg = args
+                    return self.seq_encoders[i](
+                        seq_i, mask_i_arg, rope_cos=None, rope_sin=None,
+                    )
+                seq_i, mask_i_arg, rc_arg, rs_arg = args
+                return self.seq_encoders[i](
+                    seq_i, mask_i_arg, rope_cos=rc_arg, rope_sin=rs_arg,
+                )
+
+            if run_unit is not None and unit_name is not None:
+                if rc is None or rs is None:
+                    result = run_unit(
+                        unit_name, _encode,
+                        seq_tokens_list[i], seq_padding_masks[i],
+                    )
+                else:
+                    result = run_unit(
+                        unit_name, _encode,
+                        seq_tokens_list[i], seq_padding_masks[i], rc, rs,
+                    )
+            else:
+                result = self.seq_encoders[i](
+                    seq_tokens_list[i], seq_padding_masks[i],
+                    rope_cos=rc, rope_sin=rs,
+                )
             next_seq_i, mask_i = result
             next_seqs.append(next_seq_i)
             next_masks.append(mask_i)
@@ -1255,6 +1302,9 @@ class PCVRHyFormer(nn.Module):
         self.seq_id_threshold = seq_id_threshold
         self.ns_tokenizer_type = ns_tokenizer_type
         self.sparse_embeddings = sparse_embeddings
+        self.activation_checkpoint_config = ActivationCheckpointConfig()
+        self._activation_checkpoint_units: set[str] = set()
+        self._activation_unit_stack: List[str] = []
 
         # ================== NS Tokens Construction ==================
 
@@ -1602,6 +1652,98 @@ class PCVRHyFormer(nn.Module):
         idx = torch.arange(max_len, device=device).unsqueeze(0)  # (1, max_len)
         return idx >= seq_len.unsqueeze(1)  # (B, max_len)
 
+    def iter_activation_checkpoint_units(self) -> List[str]:
+        """Returns stable activation checkpoint unit names.
+
+        Block-level units are robust to internal module edits. Sequence-encoder
+        units give finer control when a model-structure change needs a more
+        targeted checkpoint policy.
+        """
+        units = []
+        for block_idx, _ in enumerate(self.blocks):
+            units.append(f"blocks.{block_idx}")
+            for domain in self.seq_domains:
+                units.append(f"blocks.{block_idx}.seq_encoders.{domain}")
+        return units
+
+    def configure_activation_checkpointing(
+        self,
+        config: Optional[ActivationCheckpointConfig] = None,
+    ) -> None:
+        """Configures activation checkpointing without changing model weights."""
+        config = config or ActivationCheckpointConfig()
+        valid_units = set(self.iter_activation_checkpoint_units())
+        mode = config.mode
+        if mode == "none":
+            enabled_units: set[str] = set()
+        elif mode == "all_blocks":
+            enabled_units = {
+                u for u in valid_units
+                if u.startswith("blocks.") and ".seq_encoders." not in u
+            }
+        elif mode == "all_seq_encoders":
+            enabled_units = {u for u in valid_units if ".seq_encoders." in u}
+        elif mode == "custom":
+            requested = set(config.units)
+            unknown = sorted(requested - valid_units)
+            if unknown:
+                raise ValueError(
+                    "Unknown activation checkpoint units: "
+                    f"{unknown}. Valid units: {sorted(valid_units)}"
+                )
+            enabled_units = requested
+        else:
+            raise ValueError(
+                "activation checkpoint mode must be one of "
+                "none, all_blocks, all_seq_encoders, custom"
+            )
+
+        self.activation_checkpoint_config = config
+        self._activation_checkpoint_units = enabled_units
+        logging.info(
+            "Activation checkpointing mode=%s units=%s",
+            config.mode,
+            sorted(enabled_units),
+        )
+
+    @contextmanager
+    def _activation_unit(self, unit_name: str) -> Iterator[None]:
+        self._activation_unit_stack.append(unit_name)
+        try:
+            yield
+        finally:
+            self._activation_unit_stack.pop()
+
+    @property
+    def current_activation_unit(self) -> Optional[str]:
+        return self._activation_unit_stack[-1] if self._activation_unit_stack else None
+
+    def _run_activation_unit(
+        self,
+        unit_name: str,
+        fn: Callable[..., Union[torch.Tensor, Tuple[torch.Tensor, ...]]],
+        *args: torch.Tensor,
+    ) -> Union[torch.Tensor, Tuple[torch.Tensor, ...]]:
+        """Runs a named activation unit, optionally under checkpoint."""
+
+        def _traced_fn(*inner_args):
+            with self._activation_unit(unit_name):
+                return fn(*inner_args)
+
+        should_checkpoint = (
+            unit_name in self._activation_checkpoint_units
+            and self.training
+            and torch.is_grad_enabled()
+        )
+        if should_checkpoint:
+            return checkpoint(
+                _traced_fn,
+                *args,
+                use_reentrant=False,
+                preserve_rng_state=True,
+            )
+        return _traced_fn(*args)
+
     def _run_multi_seq_blocks(
         self,
         q_tokens_list: list,
@@ -1621,7 +1763,9 @@ class PCVRHyFormer(nn.Module):
         curr_seqs = seq_tokens_list
         curr_masks = seq_masks_list
 
-        for block in self.blocks:
+        S = self.num_sequences
+
+        for block_idx, block in enumerate(self.blocks):
             # Precompute RoPE cos/sin for each sequence
             rope_cos_list = None
             rope_sin_list = None
@@ -1635,14 +1779,51 @@ class PCVRHyFormer(nn.Module):
                     rope_cos_list.append(cos)
                     rope_sin_list.append(sin)
 
-            curr_qs, curr_ns, curr_seqs, curr_masks = block(
-                q_tokens_list=curr_qs,
-                ns_tokens=curr_ns,
-                seq_tokens_list=curr_seqs,
-                seq_padding_masks=curr_masks,
-                rope_cos_list=rope_cos_list,
-                rope_sin_list=rope_sin_list,
-            )
+            block_unit = f"blocks.{block_idx}"
+            seq_unit_names = [
+                f"blocks.{block_idx}.seq_encoders.{domain}"
+                for domain in self.seq_domains
+            ]
+            has_rope = rope_cos_list is not None and rope_sin_list is not None
+
+            def _run_block(*flat_args):
+                q_args = list(flat_args[:S])
+                ns_arg = flat_args[S]
+                seq_start = S + 1
+                seq_args = list(flat_args[seq_start:seq_start + S])
+                mask_start = seq_start + S
+                mask_args = list(flat_args[mask_start:mask_start + S])
+                rope_start = mask_start + S
+                if has_rope:
+                    rc_args = list(flat_args[rope_start:rope_start + S])
+                    rs_args = list(flat_args[rope_start + S:rope_start + 2 * S])
+                else:
+                    rc_args = None
+                    rs_args = None
+                next_qs, next_ns, next_seqs, next_masks = block(
+                    q_tokens_list=q_args,
+                    ns_tokens=ns_arg,
+                    seq_tokens_list=seq_args,
+                    seq_padding_masks=mask_args,
+                    rope_cos_list=rc_args,
+                    rope_sin_list=rs_args,
+                    checkpoint_unit_names=seq_unit_names,
+                    run_unit=self._run_activation_unit,
+                )
+                return tuple(next_qs + [next_ns] + next_seqs + next_masks)
+
+            flat_inputs = tuple(curr_qs + [curr_ns] + curr_seqs + curr_masks)
+            if has_rope:
+                flat_inputs = flat_inputs + tuple(rope_cos_list) + tuple(rope_sin_list)
+
+            flat_outputs = self._run_activation_unit(block_unit, _run_block, *flat_inputs)
+            flat_outputs = tuple(flat_outputs)
+            curr_qs = list(flat_outputs[:S])
+            curr_ns = flat_outputs[S]
+            seq_start = S + 1
+            curr_seqs = list(flat_outputs[seq_start:seq_start + S])
+            mask_start = seq_start + S
+            curr_masks = list(flat_outputs[mask_start:mask_start + S])
 
         # Output: concatenate all sequences' Q tokens then project via MLP
         B = curr_qs[0].shape[0]

@@ -20,7 +20,7 @@ import torch
 
 from utils import set_seed, EarlyStopping, create_logger
 from dataset import FeatureSchema, get_pcvr_data, NUM_TIME_BUCKETS
-from model import PCVRHyFormer
+from model import ActivationCheckpointConfig, PCVRHyFormer
 from trainer import PCVRHyFormerRankingTrainer
 
 
@@ -75,7 +75,7 @@ def parse_args() -> argparse.Namespace:
                         help='Shuffle buffer size, in units of batches. '
                              'Lower values reduce memory usage.')
     parser.add_argument('--train_ratio', type=float, default=1.0,
-                        help='Fraction of training Row Groups to use (takes the first N%)')
+                        help='Fraction of training Row Groups to use (takes the first N%%)')
     parser.add_argument('--valid_ratio', type=float, default=0.1,
                         help='Fraction of all Row Groups used for validation (takes the tail)')
     parser.add_argument('--eval_every_n_steps', type=int, default=0,
@@ -200,6 +200,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument('--item_ns_tokens', type=int, default=0,
                         help='Number of item NS tokens in rankmixer mode '
                              '(0 = automatically use the number of item groups)')
+    parser.add_argument('--activation_checkpoint_mode', type=str, default='none',
+                        choices=['none', 'all_blocks', 'all_seq_encoders', 'custom'],
+                        help='Activation checkpoint policy. Default keeps the '
+                             'original non-checkpointed training path.')
+    parser.add_argument('--activation_checkpoint_units', type=str, default='',
+                        help='Comma-separated activation checkpoint units used '
+                             'when --activation_checkpoint_mode=custom, e.g. '
+                             'blocks.0,blocks.1.seq_encoders.seq_d')
 
     args = parser.parse_args()
 
@@ -312,6 +320,16 @@ def main() -> None:
     }
 
     model = PCVRHyFormer(**model_args).to(args.device)
+    activation_checkpoint_units = tuple(
+        u.strip() for u in args.activation_checkpoint_units.split(',')
+        if u.strip()
+    )
+    model.configure_activation_checkpointing(
+        ActivationCheckpointConfig(
+            mode=args.activation_checkpoint_mode,
+            units=activation_checkpoint_units,
+        )
+    )
 
     # Log model sizing info.
     num_sequences = len(pcvr_dataset.seq_domains)
