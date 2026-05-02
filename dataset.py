@@ -36,6 +36,14 @@ except ImportError:  # pragma: no cover
 
     npt = _NptFallback()  # type: ignore[assignment]
 
+try:
+    from numba import njit
+
+    _NUMBA_AVAILABLE = True
+except ImportError:  # pragma: no cover
+    njit = None  # type: ignore[assignment]
+    _NUMBA_AVAILABLE = False
+
 
 # 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€ Feature Schema 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
 
@@ -130,6 +138,115 @@ BUCKET_BOUNDARIES = np.array([
 # That is why ``train.py`` / ``infer.py`` only expose the boolean flag
 # ``--use_time_buckets`` and derive the concrete bucket count from here.
 NUM_TIME_BUCKETS = len(BUCKET_BOUNDARIES) + 1
+
+
+if _NUMBA_AVAILABLE:
+    @njit(cache=True)
+    def _numba_pad_varlen_int_column(
+        offsets,
+        values,
+        max_len: int,
+        B: int,
+        padded,
+        lengths,
+    ) -> None:
+        for i in range(B):
+            start = int(offsets[i])
+            end = int(offsets[i + 1])
+            raw_len = end - start
+            if raw_len <= 0:
+                continue
+            use_len = raw_len if raw_len < max_len else max_len
+            lengths[i] = use_len
+            for j in range(use_len):
+                value = values[start + j]
+                if value > 0:
+                    padded[i, j] = value
+
+    @njit(cache=True)
+    def _numba_pad_varlen_float_column(
+        offsets,
+        values,
+        max_dim: int,
+        B: int,
+        padded,
+    ) -> None:
+        for i in range(B):
+            start = int(offsets[i])
+            end = int(offsets[i + 1])
+            raw_len = end - start
+            if raw_len <= 0:
+                continue
+            use_len = raw_len if raw_len < max_dim else max_dim
+            for j in range(use_len):
+                padded[i, j] = values[start + j]
+
+    @njit(cache=True)
+    def _numba_fill_seq_column(
+        offsets,
+        values,
+        max_len: int,
+        B: int,
+        slot: int,
+        out,
+        lengths,
+    ) -> None:
+        for i in range(B):
+            start = int(offsets[i])
+            end = int(offsets[i + 1])
+            raw_len = end - start
+            if raw_len <= 0:
+                continue
+            use_len = raw_len if raw_len < max_len else max_len
+            for j in range(use_len):
+                value = values[start + j]
+                if value > 0:
+                    out[i, slot, j] = value
+            if use_len > lengths[i]:
+                lengths[i] = use_len
+
+    @njit(cache=True)
+    def _numba_time_bucket_id(diff: int, boundaries) -> int:
+        idx = 0
+        n = boundaries.shape[0]
+        while idx < n and boundaries[idx] < diff:
+            idx += 1
+        if idx >= n:
+            idx = n - 1
+        return idx + 1
+
+    @njit(cache=True)
+    def _numba_fill_time_bucket(
+        offsets,
+        values,
+        timestamps,
+        boundaries,
+        max_len: int,
+        B: int,
+        out,
+    ) -> None:
+        for i in range(B):
+            start = int(offsets[i])
+            end = int(offsets[i + 1])
+            raw_len = end - start
+            if raw_len <= 0:
+                continue
+            use_len = raw_len if raw_len < max_len else max_len
+            current_ts = timestamps[i]
+            for j in range(use_len):
+                ts = values[start + j]
+                if ts == 0:
+                    out[i, j] = 0
+                    continue
+                diff = current_ts - ts
+                if diff < 0:
+                    diff = 0
+                out[i, j] = _numba_time_bucket_id(diff, boundaries)
+else:
+    _numba_pad_varlen_int_column = None
+    _numba_pad_varlen_float_column = None
+    _numba_fill_seq_column = None
+    _numba_fill_time_bucket = None
 
 
 class PCVRParquetDataset(IterableDataset):
@@ -267,7 +384,8 @@ class PCVRParquetDataset(IterableDataset):
         logging.info(
             f"PCVRParquetDataset: {self.num_rows} rows from "
             f"{len(self._parquet_files)} file(s), batch_size={batch_size}, "
-            f"buffer_batches={buffer_batches}, shuffle={shuffle}")
+            f"buffer_batches={buffer_batches}, shuffle={shuffle}, "
+            f"numba={_NUMBA_AVAILABLE}")
 
     def _load_schema(self, schema_path: str, seq_max_lens: Dict[str, int]) -> None:
         """Populate per-group schema information from ``schema_path``."""
@@ -463,16 +581,20 @@ class PCVRParquetDataset(IterableDataset):
         padded = np.zeros((B, max_len), dtype=np.int64)
         lengths = np.zeros(B, dtype=np.int64)
 
-        for i in range(B):
-            start, end = int(offsets[i]), int(offsets[i + 1])
-            raw_len = end - start
-            if raw_len <= 0:
-                continue
-            use_len = min(raw_len, max_len)
-            padded[i, :use_len] = values[start:start + use_len]
-            lengths[i] = use_len
+        if _NUMBA_AVAILABLE:
+            _numba_pad_varlen_int_column(
+                offsets, values, max_len, B, padded, lengths)
+        else:
+            for i in range(B):
+                start, end = int(offsets[i]), int(offsets[i + 1])
+                raw_len = end - start
+                if raw_len <= 0:
+                    continue
+                use_len = min(raw_len, max_len)
+                padded[i, :use_len] = values[start:start + use_len]
+                lengths[i] = use_len
 
-        padded[padded <= 0] = 0
+            padded[padded <= 0] = 0
         return padded, lengths
 
     # Backwards-compatible alias kept for bench_raw_dataset.py and other
@@ -492,13 +614,17 @@ class PCVRParquetDataset(IterableDataset):
 
         padded = np.zeros((B, max_dim), dtype=np.float32)
 
-        for i in range(B):
-            start, end = int(offsets[i]), int(offsets[i + 1])
-            raw_len = end - start
-            if raw_len <= 0:
-                continue
-            use_len = min(raw_len, max_dim)
-            padded[i, :use_len] = values[start:start + use_len]
+        if _NUMBA_AVAILABLE:
+            _numba_pad_varlen_float_column(
+                offsets, values, max_dim, B, padded)
+        else:
+            for i in range(B):
+                start, end = int(offsets[i]), int(offsets[i + 1])
+                raw_len = end - start
+                if raw_len <= 0:
+                    continue
+                use_len = min(raw_len, max_dim)
+                padded[i, :use_len] = values[start:start + use_len]
 
         return padded
 
@@ -597,28 +723,33 @@ class PCVRParquetDataset(IterableDataset):
             col_data = []
             for ci, slot, vs in side_plan:
                 col = batch.column(ci)
-                col_data.append((col.offsets.to_numpy(), col.values.to_numpy(), vs, ci))
+                col_data.append((col.offsets.to_numpy(), col.values.to_numpy(), vs, ci, slot))
 
-            for c, (offs, vals, vs, ci) in enumerate(col_data):
-                for i in range(B):
-                    s = int(offs[i])
-                    e = int(offs[i + 1])
-                    rl = e - s
-                    if rl <= 0:
-                        continue
-                    ul = min(rl, max_len)
-                    out[i, c, :ul] = vals[s:s + ul]
-                    if ul > lengths[i]:
-                        lengths[i] = ul
+            if _NUMBA_AVAILABLE:
+                for offs, vals, vs, ci, slot in col_data:
+                    _numba_fill_seq_column(
+                        offs, vals, max_len, B, slot, out, lengths)
+            else:
+                for offs, vals, vs, ci, slot in col_data:
+                    for i in range(B):
+                        s = int(offs[i])
+                        e = int(offs[i + 1])
+                        rl = e - s
+                        if rl <= 0:
+                            continue
+                        ul = min(rl, max_len)
+                        out[i, slot, :ul] = vals[s:s + ul]
+                        if ul > lengths[i]:
+                            lengths[i] = ul
 
-            # Values <= 0 -> 0.
-            out[out <= 0] = 0
+                # Values <= 0 -> 0.
+                out[out <= 0] = 0
 
             # Check out-of-bound values per feature's vocab_size.
             # vs==0 means no vocab info; force the whole slice to 0 so that
             # the model's 1-slot Embedding is never indexed out of range.
-            for c, (_, _, vs, ci) in enumerate(col_data):
-                slice_c = out[:, c, :]
+            for _, _, vs, ci, slot in col_data:
+                slice_c = out[:, slot, :]
                 if vs > 0:
                     self._record_oob(f'seq_{domain}', ci, slice_c, vs)
                 else:
@@ -634,35 +765,40 @@ class PCVRParquetDataset(IterableDataset):
                 ts_col = batch.column(ts_ci)
                 ts_offs = ts_col.offsets.to_numpy()
                 ts_vals = ts_col.values.to_numpy()
-                # Pad timestamps into shape (B, max_len).
-                ts_padded = np.zeros((B, max_len), dtype=np.int64)
-                for i in range(B):
-                    s = int(ts_offs[i])
-                    e = int(ts_offs[i + 1])
-                    rl = e - s
-                    if rl <= 0:
-                        continue
-                    ul = min(rl, max_len)
-                    ts_padded[i, :ul] = ts_vals[s:s + ul]
+                if _NUMBA_AVAILABLE:
+                    _numba_fill_time_bucket(
+                        ts_offs, ts_vals, timestamps, BUCKET_BOUNDARIES,
+                        max_len, B, time_bucket)
+                else:
+                    # Pad timestamps into shape (B, max_len).
+                    ts_padded = np.zeros((B, max_len), dtype=np.int64)
+                    for i in range(B):
+                        s = int(ts_offs[i])
+                        e = int(ts_offs[i + 1])
+                        rl = e - s
+                        if rl <= 0:
+                            continue
+                        ul = min(rl, max_len)
+                        ts_padded[i, :ul] = ts_vals[s:s + ul]
 
-                ts_expanded = timestamps.reshape(-1, 1)
-                time_diff = np.maximum(ts_expanded - ts_padded, 0)
-                # np.searchsorted returns values in [0, len(BUCKET_BOUNDARIES)].
-                # After +1 the nominal range is [1, len(BUCKET_BOUNDARIES)+1];
-                # the upper bound only appears when time_diff exceeds the
-                # largest boundary (~1 year) and would index past
-                # nn.Embedding(NUM_TIME_BUCKETS=len(BUCKET_BOUNDARIES)+1).
-                # Clip raw result to [0, len(BUCKET_BOUNDARIES)-1] so the final
-                # bucket id (after +1) stays within [1, len(BUCKET_BOUNDARIES)]
-                # and is always a valid Embedding index. Time-diffs beyond the
-                # largest boundary collapse into the last bucket.
-                raw_buckets = np.clip(
-                    np.searchsorted(BUCKET_BOUNDARIES, time_diff.ravel()),
-                    0, len(BUCKET_BOUNDARIES) - 1,
-                )
-                buckets = raw_buckets.reshape(B, max_len) + 1
-                buckets[ts_padded == 0] = 0
-                time_bucket[:] = buckets
+                    ts_expanded = timestamps.reshape(-1, 1)
+                    time_diff = np.maximum(ts_expanded - ts_padded, 0)
+                    # np.searchsorted returns values in [0, len(BUCKET_BOUNDARIES)].
+                    # After +1 the nominal range is [1, len(BUCKET_BOUNDARIES)+1];
+                    # the upper bound only appears when time_diff exceeds the
+                    # largest boundary (~1 year) and would index past
+                    # nn.Embedding(NUM_TIME_BUCKETS=len(BUCKET_BOUNDARIES)+1).
+                    # Clip raw result to [0, len(BUCKET_BOUNDARIES)-1] so the final
+                    # bucket id (after +1) stays within [1, len(BUCKET_BOUNDARIES)]
+                    # and is always a valid Embedding index. Time-diffs beyond the
+                    # largest boundary collapse into the last bucket.
+                    raw_buckets = np.clip(
+                        np.searchsorted(BUCKET_BOUNDARIES, time_diff.ravel()),
+                        0, len(BUCKET_BOUNDARIES) - 1,
+                    )
+                    buckets = raw_buckets.reshape(B, max_len) + 1
+                    buckets[ts_padded == 0] = 0
+                    time_bucket[:] = buckets
 
             result[f'{domain}_time_bucket'] = torch.from_numpy(time_bucket.copy())
 

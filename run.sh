@@ -11,6 +11,10 @@ python3 -u "${SCRIPT_DIR}/train.py" \
     --ns_groups_json "" \
     --emb_skip_threshold 1000000 \
     --num_workers 8 \
+    --amp_dtype bf16 \
+    --batch_size 768 \
+    --loss_type focal \
+    --focal_alpha  0.5 \
     "$@"
 
 # ---- Alternative config: GroupNSTokenizer driven by ns_groups.json ----

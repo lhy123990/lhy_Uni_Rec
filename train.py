@@ -84,6 +84,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument('--seq_max_lens', type=str,
                         default='seq_a:256,seq_b:256,seq_c:512,seq_d:512',
                         help='Per-domain sequence truncation, format: seq_d:256,seq_c:128')
+    parser.add_argument('--amp_dtype', type=str, default='auto',
+                        choices=['auto', 'bf16', 'fp16', 'fp32'],
+                        help='Autocast dtype for CUDA training/evaluation: '
+                             'auto prefers bf16 when supported, otherwise fp16; '
+                             'fp32 disables autocast')
+    parser.add_argument('--disable_amp', action='store_true', default=False,
+                        help='Disable CUDA autocast even when --amp_dtype is not fp32')
+    parser.add_argument('--precision_log_every_n_steps', type=int, default=100,
+                        help='Record AMP stability statistics every N train steps '
+                             '(0 disables train-step precision stats; validation '
+                             'stats are recorded on every validation run)')
 
     # Model hyperparameters.
     parser.add_argument('--d_model', type=int, default=64,
@@ -376,6 +387,9 @@ def main() -> None:
         ns_groups_path=args.ns_groups_json if args.ns_groups_json and os.path.exists(args.ns_groups_json) else None,
         eval_every_n_steps=args.eval_every_n_steps,
         train_config=vars(args),
+        amp_dtype=args.amp_dtype,
+        disable_amp=args.disable_amp,
+        precision_log_every_n_steps=args.precision_log_every_n_steps,
     )
 
     trainer.train()

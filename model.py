@@ -129,6 +129,23 @@ class SwiGLU(nn.Module):
         return x
 
 
+class RMSNorm(nn.Module):
+    """RMSNorm with fp32 variance computation for AMP stability."""
+
+    def __init__(self, dim: int, eps: float = 1e-6) -> None:
+        super().__init__()
+        self.eps = eps
+        self.weight = nn.Parameter(torch.ones(dim))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        output_dtype = x.dtype
+        x_float = x.float()
+        rms = x_float.pow(2).mean(dim=-1, keepdim=True)
+        x_norm = x_float * torch.rsqrt(rms + self.eps)
+        x_norm = x_norm * self.weight.float()
+        return x_norm.to(dtype=output_dtype)
+
+
 class RoPEMultiheadAttention(nn.Module):
     """Multi-head attention with Rotary Position Embedding support.
 
@@ -280,8 +297,8 @@ class CrossAttention(nn.Module):
         )
 
         if ln_mode in ['pre', 'post']:
-            self.norm_q = nn.LayerNorm(d_model)
-            self.norm_kv = nn.LayerNorm(d_model)
+            self.norm_q = RMSNorm(d_model)
+            self.norm_kv = RMSNorm(d_model)
 
     def forward(
         self,
@@ -362,12 +379,12 @@ class RankMixerBlock(nn.Module):
             self.d_sub = d_model // n_total
 
         # Per-token FFN (shared parameters) — used by both 'full' and 'ffn_only'
-        self.norm = nn.LayerNorm(d_model)
+        self.norm = RMSNorm(d_model)
         self.fc1 = nn.Linear(d_model, d_model * hidden_mult)
         self.fc2 = nn.Linear(d_model * hidden_mult, d_model)
         self.dropout = nn.Dropout(dropout)
-        # Post-LN after residual to stabilize stacked block outputs
-        self.post_norm = nn.LayerNorm(d_model)
+        # Post-RMSNorm after residual to stabilize stacked block outputs
+        self.post_norm = RMSNorm(d_model)
 
     def token_mixing(self, Q: torch.Tensor) -> torch.Tensor:
         """Performs parameter-free token mixing via reshape and transpose.
@@ -450,8 +467,8 @@ class MultiSeqQueryGenerator(nn.Module):
 
         global_info_dim = (num_ns + 1) * d_model
 
-        # LayerNorm on global_info to prevent gradient explosion from large-dim concat
-        self.global_info_norm = nn.LayerNorm(global_info_dim)
+        # RMSNorm on global_info to stabilize large-dim concat under AMP.
+        self.global_info_norm = RMSNorm(global_info_dim)
 
         # Each sequence has N independent FFNs
         self.query_ffns_per_seq = nn.ModuleList([
@@ -460,7 +477,7 @@ class MultiSeqQueryGenerator(nn.Module):
                     nn.Linear(global_info_dim, d_model * hidden_mult),
                     nn.SiLU(),
                     nn.Linear(d_model * hidden_mult, d_model),
-                    nn.LayerNorm(d_model),
+                    RMSNorm(d_model),
                 )
                 for _ in range(num_queries)
             ])
@@ -526,7 +543,7 @@ class SwiGLUEncoder(nn.Module):
         dropout: float = 0.0
     ) -> None:
         super().__init__()
-        self.norm = nn.LayerNorm(d_model)
+        self.norm = RMSNorm(d_model)
         self.swiglu = SwiGLU(d_model, hidden_mult)
         self.dropout = nn.Dropout(dropout)
 
@@ -558,7 +575,7 @@ class SwiGLUEncoder(nn.Module):
 class TransformerEncoder(nn.Module):
     """High-capacity sequence encoder with self-attention and RoPE.
 
-    Structure: Standard Transformer Encoder Layer (Pre-LN).
+    Structure: Standard Transformer Encoder Layer (Pre-RMSNorm).
     """
 
     def __init__(
@@ -569,8 +586,8 @@ class TransformerEncoder(nn.Module):
         dropout: float = 0.0
     ) -> None:
         super().__init__()
-        self.norm1 = nn.LayerNorm(d_model)
-        self.norm2 = nn.LayerNorm(d_model)
+        self.norm1 = RMSNorm(d_model)
+        self.norm2 = RMSNorm(d_model)
 
         self.self_attn = RoPEMultiheadAttention(
             d_model=d_model,
@@ -606,7 +623,7 @@ class TransformerEncoder(nn.Module):
         Returns:
             Tuple of (output tensor of shape (B, L, D), key_padding_mask).
         """
-        # Self-Attention (Pre-LN) with RoPE
+        # Self-Attention (Pre-RMSNorm) with RoPE
         residual = x
         x = self.norm1(x)
         x, _ = self.self_attn(
@@ -619,7 +636,7 @@ class TransformerEncoder(nn.Module):
         )
         x = residual + x
 
-        # FFN (Pre-LN)
+        # FFN (Pre-RMSNorm)
         residual = x
         x = self.norm2(x)
         x = self.ffn(x)
@@ -656,9 +673,9 @@ class LongerEncoder(nn.Module):
         self.top_k = top_k
         self.causal = causal
 
-        # Pre-LN for attention
-        self.norm_q = nn.LayerNorm(d_model)
-        self.norm_kv = nn.LayerNorm(d_model)
+        # Pre-RMSNorm for attention
+        self.norm_q = RMSNorm(d_model)
+        self.norm_kv = RMSNorm(d_model)
 
         # Shared RoPEMHA for both cross and self attention
         self.attn = RoPEMultiheadAttention(
@@ -668,8 +685,8 @@ class LongerEncoder(nn.Module):
             rope_on_q=True,
         )
 
-        # FFN (Pre-LN + residual)
-        self.ffn_norm = nn.LayerNorm(d_model)
+        # FFN (Pre-RMSNorm + residual)
+        self.ffn_norm = RMSNorm(d_model)
         hidden_dim = d_model * hidden_mult
         self.ffn = nn.Sequential(
             nn.Linear(d_model, hidden_dim),
@@ -759,7 +776,7 @@ class LongerEncoder(nn.Module):
             # 1. Extract latest top_k tokens as query
             q, new_mask, q_pos_indices = self._gather_top_k(x, key_padding_mask)
 
-            # 2. Pre-LN
+            # 2. Pre-RMSNorm
             q_normed = self.norm_q(q)
             kv_normed = self.norm_kv(x)
 
@@ -792,7 +809,7 @@ class LongerEncoder(nn.Module):
             # === Self Attention mode (subsequent MultiSeqHyFormerBlocks) ===
             new_mask = key_padding_mask
 
-            # Pre-LN (Q and KV share norm_q)
+            # Pre-RMSNorm (Q and KV share norm_q)
             x_normed = self.norm_q(x)
 
             # Causal mask
@@ -813,7 +830,7 @@ class LongerEncoder(nn.Module):
             )
             out = x + attn_out
 
-        # FFN (Pre-LN + residual)
+        # FFN (Pre-RMSNorm + residual)
         residual = out
         out = self.ffn_norm(out)
         out = self.ffn(out)
@@ -1073,11 +1090,11 @@ class GroupNSTokenizer(nn.Module):
             else:
                 self._emb_index.append(-1)
 
-        # Per-group projection: num_fids_in_group * emb_dim -> d_model (with LayerNorm)
+        # Per-group projection: num_fids_in_group * emb_dim -> d_model (with RMSNorm)
         self.group_projs = nn.ModuleList([
             nn.Sequential(
                 nn.Linear(len(group) * emb_dim, d_model),
-                nn.LayerNorm(d_model),
+                RMSNorm(d_model),
             )
             for group in groups
         ])
@@ -1186,11 +1203,11 @@ class RankMixerNSTokenizer(nn.Module):
         self.padded_total_dim = self.chunk_dim * num_ns_tokens
         self._pad_size = self.padded_total_dim - total_emb_dim
 
-        # Per-chunk projection: chunk_dim -> d_model with LayerNorm
+        # Per-chunk projection: chunk_dim -> d_model with RMSNorm
         self.token_projs = nn.ModuleList([
             nn.Sequential(
                 nn.Linear(self.chunk_dim, d_model),
-                nn.LayerNorm(d_model),
+                RMSNorm(d_model),
             )
             for _ in range(num_ns_tokens)
         ])
@@ -1365,7 +1382,7 @@ class PCVRHyFormer(nn.Module):
         if self.has_user_dense:
             self.user_dense_proj = nn.Sequential(
                 nn.Linear(user_dense_dim, d_model),
-                nn.LayerNorm(d_model),
+                RMSNorm(d_model),
             )
 
         # Item dense feature projection (if available)
@@ -1373,7 +1390,7 @@ class PCVRHyFormer(nn.Module):
         if self.has_item_dense:
             self.item_dense_proj = nn.Sequential(
                 nn.Linear(item_dense_dim, d_model),
-                nn.LayerNorm(d_model),
+                RMSNorm(d_model),
             )
 
         # Total NS token count
@@ -1438,7 +1455,7 @@ class PCVRHyFormer(nn.Module):
             self._seq_vocab_sizes[domain] = vs
             self._seq_proj[domain] = nn.Sequential(
                 nn.Linear(len(vs) * emb_dim, d_model),
-                nn.LayerNorm(d_model),
+                RMSNorm(d_model),
             )
 
         # ================== Time Interval Bucket Embedding (optional) ==================
@@ -1486,7 +1503,7 @@ class PCVRHyFormer(nn.Module):
         # Output projection
         self.output_proj = nn.Sequential(
             nn.Linear(num_queries * self.num_sequences * d_model, d_model),
-            nn.LayerNorm(d_model),
+            RMSNorm(d_model),
         )
 
         # Dropout
@@ -1495,7 +1512,7 @@ class PCVRHyFormer(nn.Module):
         # Classifier
         self.clsfier = nn.Sequential(
             nn.Linear(d_model, d_model),
-            nn.LayerNorm(d_model),
+            RMSNorm(d_model),
             nn.SiLU(),
             nn.Dropout(dropout_rate),
             nn.Linear(d_model, action_num)
@@ -1651,6 +1668,22 @@ class PCVRHyFormer(nn.Module):
         device = seq_len.device
         idx = torch.arange(max_len, device=device).unsqueeze(0)  # (1, max_len)
         return idx >= seq_len.unsqueeze(1)  # (B, max_len)
+
+    def _project_dense_feature_token(
+        self,
+        proj: nn.Module,
+        dense_feats: torch.Tensor,
+        output_dtype: torch.dtype,
+    ) -> torch.Tensor:
+        """Project raw dense features in fp32 before returning to AMP dtype."""
+        if dense_feats.is_cuda:
+            with torch.autocast(device_type='cuda', enabled=False):
+                token = F.silu(proj(dense_feats.float()))
+        else:
+            token = F.silu(proj(dense_feats.float()))
+        if token.dtype != output_dtype:
+            token = token.to(dtype=output_dtype)
+        return token.unsqueeze(1)
 
     def iter_activation_checkpoint_units(self) -> List[str]:
         """Returns stable activation checkpoint unit names.
@@ -1841,11 +1874,13 @@ class PCVRHyFormer(nn.Module):
 
         ns_parts = [user_ns]
         if self.has_user_dense:
-            user_dense_tok = F.silu(self.user_dense_proj(inputs.user_dense_feats)).unsqueeze(1)  # (B, 1, D)
+            user_dense_tok = self._project_dense_feature_token(
+                self.user_dense_proj, inputs.user_dense_feats, user_ns.dtype)
             ns_parts.append(user_dense_tok)
         ns_parts.append(item_ns)
         if self.has_item_dense:
-            item_dense_tok = F.silu(self.item_dense_proj(inputs.item_dense_feats)).unsqueeze(1)  # (B, 1, D)
+            item_dense_tok = self._project_dense_feature_token(
+                self.item_dense_proj, inputs.item_dense_feats, item_ns.dtype)
             ns_parts.append(item_dense_tok)
 
         ns_tokens = torch.cat(ns_parts, dim=1)  # (B, num_ns, D)
@@ -1884,11 +1919,13 @@ class PCVRHyFormer(nn.Module):
 
         ns_parts = [user_ns]
         if self.has_user_dense:
-            user_dense_tok = F.silu(self.user_dense_proj(inputs.user_dense_feats)).unsqueeze(1)
+            user_dense_tok = self._project_dense_feature_token(
+                self.user_dense_proj, inputs.user_dense_feats, user_ns.dtype)
             ns_parts.append(user_dense_tok)
         ns_parts.append(item_ns)
         if self.has_item_dense:
-            item_dense_tok = F.silu(self.item_dense_proj(inputs.item_dense_feats)).unsqueeze(1)
+            item_dense_tok = self._project_dense_feature_token(
+                self.item_dense_proj, inputs.item_dense_feats, item_ns.dtype)
             ns_parts.append(item_dense_tok)
 
         ns_tokens = torch.cat(ns_parts, dim=1)

@@ -8,6 +8,7 @@ import os
 import glob
 import shutil
 import logging
+from contextlib import nullcontext
 from typing import Any, Dict, Optional, Tuple
 
 import numpy as np
@@ -58,6 +59,9 @@ class PCVRHyFormerRankingTrainer:
         ns_groups_path: Optional[str] = None,
         eval_every_n_steps: int = 0,
         train_config: Optional[Dict[str, Any]] = None,
+        amp_dtype: str = 'auto',
+        disable_amp: bool = False,
+        precision_log_every_n_steps: int = 100,
     ) -> None:
         self.model: nn.Module = model
         self.train_loader: DataLoader = train_loader
@@ -110,6 +114,19 @@ class PCVRHyFormerRankingTrainer:
         self.ckpt_params: Dict[str, Any] = ckpt_params or {}
         self.eval_every_n_steps: int = eval_every_n_steps
         self.train_config: Optional[Dict[str, Any]] = train_config
+        self.device_type: str = torch.device(device).type
+        self.precision_log_every_n_steps: int = max(
+            0, int(precision_log_every_n_steps)
+        )
+        self.amp_enabled, self.amp_dtype = self._resolve_amp_config(
+            amp_dtype=amp_dtype,
+            disable_amp=disable_amp,
+        )
+        scaler_enabled = self.amp_enabled and self.amp_dtype == torch.float16
+        try:
+            self.scaler = torch.amp.GradScaler('cuda', enabled=scaler_enabled)
+        except TypeError:  # pragma: no cover - compatibility with older torch
+            self.scaler = torch.cuda.amp.GradScaler(enabled=scaler_enabled)
         if sparse_weight_decay != 0.0 and getattr(model, 'sparse_embeddings', False):
             raise ValueError(
                 "sparse_weight_decay must be 0.0 when sparse embedding "
@@ -120,6 +137,125 @@ class PCVRHyFormerRankingTrainer:
         logging.info(f"PCVRHyFormerRankingTrainer loss_type={loss_type}, "
                      f"focal_alpha={focal_alpha}, focal_gamma={focal_gamma}, "
                      f"reinit_sparse_after_epoch={reinit_sparse_after_epoch}")
+        logging.info(
+            "AMP config: enabled=%s, requested=%s, resolved=%s, "
+            "grad_scaler=%s, precision_log_every_n_steps=%d",
+            self.amp_enabled,
+            amp_dtype,
+            self._amp_dtype_name(self.amp_dtype),
+            self.scaler.is_enabled(),
+            self.precision_log_every_n_steps,
+        )
+
+    @staticmethod
+    def _amp_dtype_name(dtype: Optional[torch.dtype]) -> str:
+        if dtype is torch.bfloat16:
+            return 'bf16'
+        if dtype is torch.float16:
+            return 'fp16'
+        return 'fp32'
+
+    def _resolve_amp_config(
+        self,
+        amp_dtype: str,
+        disable_amp: bool,
+    ) -> Tuple[bool, Optional[torch.dtype]]:
+        """Resolve user AMP flags into an autocast dtype.
+
+        CUDA bf16 is preferred for H20-class online training. On devices where
+        bf16 is unavailable, auto mode falls back to fp16 and enables
+        GradScaler for training.
+        """
+        amp_dtype = amp_dtype.lower()
+        if disable_amp or amp_dtype == 'fp32' or self.device_type != 'cuda':
+            return False, None
+
+        if amp_dtype == 'auto':
+            if torch.cuda.is_available() and torch.cuda.is_bf16_supported():
+                return True, torch.bfloat16
+            return True, torch.float16
+
+        if amp_dtype == 'bf16':
+            if torch.cuda.is_available() and torch.cuda.is_bf16_supported():
+                return True, torch.bfloat16
+            logging.warning(
+                "Requested bf16 AMP, but CUDA bf16 is not reported as "
+                "supported. Falling back to fp16 AMP."
+            )
+            return True, torch.float16
+
+        if amp_dtype == 'fp16':
+            return True, torch.float16
+
+        raise ValueError(
+            "amp_dtype must be one of auto, bf16, fp16, or fp32; "
+            f"got {amp_dtype!r}"
+        )
+
+    def _autocast_context(self):
+        if not self.amp_enabled or self.amp_dtype is None:
+            return nullcontext()
+        return torch.autocast(device_type=self.device_type, dtype=self.amp_dtype)
+
+    @staticmethod
+    def _tensor_mean_var(tensor: torch.Tensor) -> Tuple[float, float]:
+        if tensor.numel() == 0:
+            return 0.0, 0.0
+        t = tensor.detach().float()
+        mean = float(t.mean().item())
+        var = float(t.var(unbiased=False).item()) if t.numel() > 1 else 0.0
+        return mean, var
+
+    @staticmethod
+    def _running_mean_var(
+        total_sum: float,
+        total_sumsq: float,
+        total_count: int,
+    ) -> Tuple[float, float]:
+        if total_count <= 0:
+            return 0.0, 0.0
+        mean = total_sum / total_count
+        var = max(total_sumsq / total_count - mean * mean, 0.0)
+        return float(mean), float(var)
+
+    def _should_log_precision(
+        self,
+        global_step: Optional[int],
+        force: bool = False,
+    ) -> bool:
+        if self.writer is None:
+            return False
+        if force:
+            return True
+        if self.precision_log_every_n_steps <= 0 or global_step is None:
+            return False
+        return global_step <= 1 or global_step % self.precision_log_every_n_steps == 0
+
+    def _write_tensor_stats(
+        self,
+        name: str,
+        tensor: torch.Tensor,
+        global_step: int,
+    ) -> None:
+        if self.writer is None:
+            return
+        mean, var = self._tensor_mean_var(tensor)
+        self.writer.add_scalar(f'Precision/{name}_mean', mean, global_step)
+        self.writer.add_scalar(f'Precision/{name}_var', var, global_step)
+
+    def _write_running_stats(
+        self,
+        name: str,
+        total_sum: float,
+        total_sumsq: float,
+        total_count: int,
+        global_step: int,
+    ) -> None:
+        if self.writer is None:
+            return
+        mean, var = self._running_mean_var(total_sum, total_sumsq, total_count)
+        self.writer.add_scalar(f'Precision/{name}_mean', mean, global_step)
+        self.writer.add_scalar(f'Precision/{name}_var', var, global_step)
 
     def _clip_dense_grad_norm(self, max_norm: float) -> torch.Tensor:
         """Clip only dense gradients.
@@ -328,8 +464,9 @@ class PCVRHyFormerRankingTrainer:
             loss_sum = 0.0
 
             for step, batch in train_pbar:
-                loss = self._train_step(batch)
-                total_step += 1
+                next_step = total_step + 1
+                loss = self._train_step(batch, global_step=next_step)
+                total_step = next_step
                 loss_sum += loss
 
                 if self.writer:
@@ -340,7 +477,8 @@ class PCVRHyFormerRankingTrainer:
                 # Step-level validation (only when eval_every_n_steps > 0).
                 if self.eval_every_n_steps > 0 and total_step % self.eval_every_n_steps == 0:
                     logging.info(f"Evaluating at step {total_step}")
-                    val_auc, val_logloss = self.evaluate(epoch=epoch)
+                    val_auc, val_logloss = self.evaluate(
+                        epoch=epoch, global_step=total_step)
                     self.model.train()
                     torch.cuda.empty_cache()
 
@@ -358,7 +496,8 @@ class PCVRHyFormerRankingTrainer:
 
             logging.info(f"Epoch {epoch}, Average Loss: {loss_sum / len(self.train_loader)}")
 
-            val_auc, val_logloss = self.evaluate(epoch=epoch)
+            val_auc, val_logloss = self.evaluate(
+                epoch=epoch, global_step=total_step)
             self.model.train()
             torch.cuda.empty_cache()
 
@@ -426,7 +565,7 @@ class PCVRHyFormerRankingTrainer:
             seq_time_buckets=seq_time_buckets,
         )
 
-    def _train_step(self, batch: Dict[str, Any]) -> float:
+    def _train_step(self, batch: Dict[str, Any], global_step: int) -> float:
         """Run a single training step and return the scalar loss value."""
         device_batch = self._batch_to_device(batch)
         label = device_batch['label'].float()
@@ -436,23 +575,51 @@ class PCVRHyFormerRankingTrainer:
             self.sparse_optimizer.zero_grad(set_to_none=True)
 
         model_input = self._make_model_input(device_batch)
-        logits = self.model(model_input)  # (B, 1)
-        logits = logits.squeeze(-1)  # (B,)
+        with self._autocast_context():
+            logits = self.model(model_input)  # (B, 1)
+            logits = logits.squeeze(-1)  # (B,)
 
-        if self.loss_type == 'focal':
-            loss = sigmoid_focal_loss(logits, label, alpha=self.focal_alpha, gamma=self.focal_gamma)
+            if self.loss_type == 'focal':
+                loss = sigmoid_focal_loss(
+                    logits, label, alpha=self.focal_alpha,
+                    gamma=self.focal_gamma)
+            else:
+                loss = F.binary_cross_entropy_with_logits(logits, label)
+
+        log_precision = self._should_log_precision(global_step)
+        if log_precision:
+            self._write_tensor_stats('train_logits', logits, global_step)
+
+        if self.scaler.is_enabled():
+            self.scaler.scale(loss).backward()
+            self.scaler.unscale_(self.dense_optimizer)
+            if self.sparse_optimizer is not None:
+                self.scaler.unscale_(self.sparse_optimizer)
+            self._clip_dense_grad_norm(max_norm=1.0)
+            self.scaler.step(self.dense_optimizer)
+            if self.sparse_optimizer is not None:
+                self.scaler.step(self.sparse_optimizer)
+            self.scaler.update()
+            if log_precision and self.writer:
+                self.writer.add_scalar(
+                    'Precision/loss_scaler',
+                    float(self.scaler.get_scale()),
+                    global_step,
+                )
         else:
-            loss = F.binary_cross_entropy_with_logits(logits, label)
-        loss.backward()
-        self._clip_dense_grad_norm(max_norm=1.0)
-
-        self.dense_optimizer.step()
-        if self.sparse_optimizer is not None:
-            self.sparse_optimizer.step()
+            loss.backward()
+            self._clip_dense_grad_norm(max_norm=1.0)
+            self.dense_optimizer.step()
+            if self.sparse_optimizer is not None:
+                self.sparse_optimizer.step()
 
         return loss.item()
 
-    def evaluate(self, epoch: Optional[int] = None) -> Tuple[float, float]:
+    def evaluate(
+        self,
+        epoch: Optional[int] = None,
+        global_step: Optional[int] = None,
+    ) -> Tuple[float, float]:
         """Run validation over ``self.valid_loader`` and return ``(AUC, logloss)``.
 
         NaN predictions (which can arise from exploding gradients) are filtered
@@ -467,15 +634,33 @@ class PCVRHyFormerRankingTrainer:
 
         all_logits_list = []
         all_labels_list = []
+        embedding_sum = 0.0
+        embedding_sumsq = 0.0
+        embedding_count = 0
 
         with torch.no_grad():
             for step, batch in pbar:
-                logits, labels = self._evaluate_step(batch)
+                logits, labels, embeddings = self._evaluate_step(batch)
                 all_logits_list.append(logits.detach().cpu())
                 all_labels_list.append(labels.detach().cpu())
+                embeddings_f = embeddings.detach().float()
+                embedding_sum += float(embeddings_f.sum().item())
+                embedding_sumsq += float((embeddings_f * embeddings_f).sum().item())
+                embedding_count += int(embeddings_f.numel())
 
         all_logits = torch.cat(all_logits_list, dim=0)
         all_labels = torch.cat(all_labels_list, dim=0).long()
+        log_step = int(global_step if global_step is not None else epoch)
+        if self._should_log_precision(log_step, force=True):
+            self._write_tensor_stats('valid_logits', all_logits, log_step)
+            self._write_tensor_stats('predict_logits', all_logits, log_step)
+            self._write_running_stats(
+                'predict_embedding',
+                embedding_sum,
+                embedding_sumsq,
+                embedding_count,
+                log_step,
+            )
 
         # Binary AUC via sklearn.
         probs = torch.sigmoid(all_logits).numpy()
@@ -507,13 +692,14 @@ class PCVRHyFormerRankingTrainer:
 
     def _evaluate_step(
         self, batch: Dict[str, Any]
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Run a single validation step and return ``(logits, labels)``."""
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Run a single validation step and return logits, labels, embeddings."""
         device_batch = self._batch_to_device(batch)
         label = device_batch['label']
 
         model_input = self._make_model_input(device_batch)
-        logits, _ = self.model.predict(model_input)  # (B, 1), (B, D)
+        with self._autocast_context():
+            logits, embeddings = self.model.predict(model_input)  # (B, 1), (B, D)
         logits = logits.squeeze(-1)  # (B,)
 
-        return logits, label
+        return logits.float(), label, embeddings
