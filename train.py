@@ -59,7 +59,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument('--num_epochs', type=int, default=999,
                         help='Maximum number of training epochs '
                              '(typically terminated earlier by early stopping)')
-    parser.add_argument('--patience', type=int, default=5,
+    parser.add_argument('--patience', type=int, default=3,
                         help='Early-stopping patience '
                              '(number of validations without improvement)')
     parser.add_argument('--seed', type=int, default=42,
@@ -146,9 +146,9 @@ def parse_args() -> argparse.Namespace:
                         help='RoPE base frequency (default 10000)')
 
     # Loss function.
-    parser.add_argument('--loss_type', type=str, default='bce', choices=['bce', 'focal'],
+    parser.add_argument('--loss_type', type=str, default='focal', choices=['bce', 'focal'],
                         help='Loss type: bce = BCEWithLogits, focal = Focal Loss')
-    parser.add_argument('--focal_alpha', type=float, default=0.1,
+    parser.add_argument('--focal_alpha', type=float, default=0.5,
                         help='Focal Loss positive-class weight alpha '
                              '(effective only when --loss_type=focal)')
     parser.add_argument('--focal_gamma', type=float, default=2.0,

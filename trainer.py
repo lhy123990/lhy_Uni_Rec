@@ -8,6 +8,7 @@ import os
 import glob
 import shutil
 import logging
+from dataclasses import dataclass
 from contextlib import nullcontext
 from typing import Any, Dict, Optional, Tuple
 
@@ -62,6 +63,7 @@ class PCVRHyFormerRankingTrainer:
         amp_dtype: str = 'auto',
         disable_amp: bool = False,
         precision_log_every_n_steps: int = 100,
+        topk_best: int = 3,
     ) -> None:
         self.model: nn.Module = model
         self.train_loader: DataLoader = train_loader
@@ -134,6 +136,12 @@ class PCVRHyFormerRankingTrainer:
                 "weight decay for sparse gradients."
             )
 
+        self.topk_best: int = int(topk_best)
+        if self.topk_best < 1:
+            raise ValueError(f"topk_best must be >= 1, got {self.topk_best}")
+        self._topk_ckpts: list[tuple[float, int, str]] = []
+        self._load_existing_topk_checkpoints()
+
         logging.info(f"PCVRHyFormerRankingTrainer loss_type={loss_type}, "
                      f"focal_alpha={focal_alpha}, focal_gamma={focal_gamma}, "
                      f"reinit_sparse_after_epoch={reinit_sparse_after_epoch}")
@@ -146,6 +154,7 @@ class PCVRHyFormerRankingTrainer:
             self.scaler.is_enabled(),
             self.precision_log_every_n_steps,
         )
+        logging.info("Checkpoint retention: keep top-%d checkpoints by val AUC", self.topk_best)
 
     @staticmethod
     def _amp_dtype_name(dtype: Optional[torch.dtype]) -> str:
@@ -357,14 +366,80 @@ class PCVRHyFormerRankingTrainer:
         logging.info(f"Saved checkpoint to {ckpt_dir}/model.pt")
         return ckpt_dir
 
-    def _remove_old_best_dirs(self) -> None:
-        """Delete stale ``*.best_model`` directories so that only the latest
-        best checkpoint is kept on disk.
-        """
-        pattern = os.path.join(self.save_dir, "global_step*.best_model")
-        for old_dir in glob.glob(pattern):
-            shutil.rmtree(old_dir)
-            logging.info(f"Removed old best_model dir: {old_dir}")
+    def _format_auc_for_dir(self, val_auc: float) -> str:
+        return f"{val_auc:.6f}"
+
+    def _build_topk_dir_name(self, global_step: int, val_auc: float) -> str:
+        base = self._build_step_dir_name(global_step, is_best=False)
+        return f"{base}.topk_auc={self._format_auc_for_dir(val_auc)}"
+
+    def _load_existing_topk_checkpoints(self) -> None:
+        pattern = os.path.join(self.save_dir, "global_step*.topk_auc=*")
+        found: list[tuple[float, int, str]] = []
+        for ckpt_dir in glob.glob(pattern):
+            name = os.path.basename(ckpt_dir)
+            try:
+                step_str = name.split("global_step", 1)[1].split(".", 1)[0]
+                step = int(step_str)
+                auc_part = [p for p in name.split(".") if p.startswith("topk_auc=")][0]
+                auc = float(auc_part.split("=", 1)[1])
+            except Exception:
+                continue
+            if not os.path.exists(os.path.join(ckpt_dir, "model.pt")):
+                continue
+            found.append((auc, step, ckpt_dir))
+
+        found.sort(key=lambda x: (-x[0], -x[1]))
+        self._topk_ckpts = found[: self.topk_best]
+        for auc, step, ckpt_dir in found[self.topk_best :]:
+            try:
+                shutil.rmtree(ckpt_dir)
+                logging.info(
+                    "Pruned extra topk checkpoint: step=%d auc=%.6f dir=%s",
+                    step, auc, ckpt_dir,
+                )
+            except Exception as e:
+                logging.warning("Failed to prune %s: %s", ckpt_dir, e)
+
+    def _maybe_save_topk_checkpoint(self, global_step: int, val_auc: float) -> None:
+        if not np.isfinite(val_auc):
+            return
+
+        for _, step, _ in self._topk_ckpts:
+            if step == global_step:
+                return
+
+        qualifies = len(self._topk_ckpts) < self.topk_best
+        if not qualifies:
+            worst_auc = min(a for a, _, _ in self._topk_ckpts)
+            qualifies = val_auc > worst_auc
+        if not qualifies:
+            return
+
+        ckpt_dir = self._save_step_checkpoint(
+            global_step,
+            is_best=False,
+            skip_model_file=False,
+            dir_name=self._build_topk_dir_name(global_step, val_auc),
+        )
+        self._topk_ckpts.append((val_auc, global_step, ckpt_dir))
+        self._topk_ckpts.sort(key=lambda x: (-x[0], -x[1]))
+
+        while len(self._topk_ckpts) > self.topk_best:
+            auc, step, stale_dir = self._topk_ckpts.pop(-1)
+            try:
+                shutil.rmtree(stale_dir)
+                logging.info(
+                    "Removed stale (outside top-%d) ckpt: step=%d auc=%.6f dir=%s",
+                    self.topk_best, step, auc, stale_dir,
+                )
+            except Exception as e:
+                logging.warning("Failed to remove stale checkpoint dir %s: %s", stale_dir, e)
+
+        logging.info(
+            "Topk checkpoints now: %s",
+            ", ".join([f"(auc={a:.6f}, step={s})" for a, s, _ in self._topk_ckpts]),
+        )
 
     def _batch_to_device(self, batch: Dict[str, Any]) -> Dict[str, Any]:
         """Move all tensors in ``batch`` to ``self.device`` (``non_blocking=True``,
@@ -384,70 +459,12 @@ class PCVRHyFormerRankingTrainer:
         val_auc: float,
         val_logloss: float,
     ) -> None:
-        """Persist a new-best checkpoint atomically.
-
-        Flow (ordered to avoid leaving empty sidecar-only directories on disk):
-
-        1. Decide whether ``val_auc`` is *likely* to beat the current best
-           using the same threshold as ``EarlyStopping._is_not_improved``,
-           so our pre-cleanup and EarlyStopping's internal save decision
-           stay in sync.
-        2. If unlikely, short-circuit: do nothing on disk. We must NOT
-           touch ``self.early_stopping.checkpoint_path`` or call
-           ``_write_sidecar_files`` because the target directory may not
-           exist yet (sidecar-only dirs would otherwise be created here,
-           producing checkpoints with missing ``model.pt``).
-        3. If likely, point ``EarlyStopping`` at the canonical
-           ``global_stepN.best_model/model.pt`` path, remove any stale
-           ``*.best_model`` dirs, then run ``EarlyStopping`` (which writes
-           ``model.pt`` when it actually confirms a new best).
-        4. Only after ``EarlyStopping`` has confirmed a new best
-           (``best_score != old_best``) do we write the sidecar files into
-           the freshly-created directory; this is guarded so that a
-           razor-close score that tripped ``is_likely_new_best`` but not
-           ``EarlyStopping``'s own gate does not create a stray dir.
-        """
-        old_best = self.early_stopping.best_score
-        is_likely_new_best = (
-            old_best is None
-            or val_auc > old_best + self.early_stopping.delta
-        )
-        if not is_likely_new_best:
-            # No new best anticipated: leave disk untouched. The previous
-            # best_model dir (with its model.pt + sidecars) remains valid.
-            self.early_stopping(val_auc, self.model, {
-                "best_val_AUC": val_auc,
-                "best_val_logloss": val_logloss,
-            })
-            return
-
-        # Point EarlyStopping at the canonical best-model location for this
-        # step. Only done on the likely-new-best branch so that a skipped
-        # save never leaks the unused path into EarlyStopping state.
-        best_dir = os.path.join(
-            self.save_dir,
-            self._build_step_dir_name(total_step, is_best=True),
-        )
-        self.early_stopping.checkpoint_path = os.path.join(best_dir, "model.pt")
-
-        # Remove stale best dirs first so EarlyStopping's write is the only
-        # I/O needed when a new best is confirmed.
-        self._remove_old_best_dirs()
-
+        """Persist validation state and keep the top-K AUC checkpoints."""
         self.early_stopping(val_auc, self.model, {
             "best_val_AUC": val_auc,
             "best_val_logloss": val_logloss,
         })
-
-        # Write sidecar files only when EarlyStopping actually confirmed a
-        # new best and wrote model.pt. If the score tripped our heuristic
-        # but EarlyStopping internally declined to save, skip to avoid
-        # creating an empty (sidecar-only) checkpoint directory.
-        if self.early_stopping.best_score != old_best and os.path.exists(
-            self.early_stopping.checkpoint_path
-        ):
-            self._save_step_checkpoint(
-                total_step, is_best=True, skip_model_file=True)
+        self._maybe_save_topk_checkpoint(total_step, val_auc)
 
     def train(self) -> None:
         """Main training loop: iterates over epochs, performs step-level and
