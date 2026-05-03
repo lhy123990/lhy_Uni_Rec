@@ -353,6 +353,9 @@ class PCVRHyFormerRankingTrainer:
             skip_model_file: if True, skip writing ``model.pt`` (because the
                 caller, e.g. EarlyStopping, has already persisted it to the
                 same path). Sidecar files are still (re)written.
+            dir_name: optional custom directory name. If None, auto-generated from
+                global_step and is_best. Used by _maybe_save_topk_checkpoint to
+                include AUC info in the directory name.
 
         Returns:
             The absolute path of the checkpoint directory.
@@ -420,8 +423,20 @@ class PCVRHyFormerRankingTrainer:
             global_step,
             is_best=False,
             skip_model_file=False,
-            dir_name=self._build_topk_dir_name(global_step, val_auc),
         )
+        # Rename the checkpoint dir to include the topk AUC suffix.
+        topk_name = self._build_topk_dir_name(global_step, val_auc)
+        topk_path = os.path.join(self.save_dir, topk_name)
+        if topk_path != ckpt_dir:
+            try:
+                os.replace(ckpt_dir, topk_path)
+                ckpt_dir = topk_path
+            except Exception:
+                try:
+                    shutil.move(ckpt_dir, topk_path)
+                    ckpt_dir = topk_path
+                except Exception:
+                    logging.warning("Failed to rename ckpt %s to %s", ckpt_dir, topk_path)
         self._topk_ckpts.append((val_auc, global_step, ckpt_dir))
         self._topk_ckpts.sort(key=lambda x: (-x[0], -x[1]))
 
@@ -564,6 +579,7 @@ class PCVRHyFormerRankingTrainer:
         seq_data: Dict[str, torch.Tensor] = {}
         seq_lens: Dict[str, torch.Tensor] = {}
         seq_time_buckets: Dict[str, torch.Tensor] = {}
+        seq_abs_time_feats: Dict[str, torch.Tensor] = {}
         for domain in seq_domains:
             seq_data[domain] = device_batch[domain]
             seq_lens[domain] = device_batch[f'{domain}_len']
@@ -572,6 +588,10 @@ class PCVRHyFormerRankingTrainer:
             seq_time_buckets[domain] = device_batch.get(
                 f'{domain}_time_bucket',
                 torch.zeros(B, L, dtype=torch.long, device=self.device))
+            seq_abs_time_feats[domain] = device_batch.get(
+                f'{domain}_abs_time_feats',
+                torch.zeros(B, 3, L, dtype=torch.long, device=self.device),
+            )
         return ModelInput(
             user_int_feats=device_batch['user_int_feats'],
             item_int_feats=device_batch['item_int_feats'],
@@ -580,6 +600,7 @@ class PCVRHyFormerRankingTrainer:
             seq_data=seq_data,
             seq_lens=seq_lens,
             seq_time_buckets=seq_time_buckets,
+            seq_abs_time_feats=seq_abs_time_feats,
         )
 
     def _train_step(self, batch: Dict[str, Any], global_step: int) -> float:

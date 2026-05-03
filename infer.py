@@ -284,6 +284,7 @@ def _batch_to_model_input(
     seq_data: Dict[str, torch.Tensor] = {}
     seq_lens: Dict[str, torch.Tensor] = {}
     seq_time_buckets: Dict[str, torch.Tensor] = {}
+    seq_abs_time_feats: Dict[str, torch.Tensor] = {}
     for domain in seq_domains:
         seq_data[domain] = device_batch[domain]
         seq_lens[domain] = device_batch[f'{domain}_len']
@@ -291,6 +292,9 @@ def _batch_to_model_input(
         seq_time_buckets[domain] = device_batch.get(
             f'{domain}_time_bucket',
             torch.zeros(B, L, dtype=torch.long, device=device))
+        seq_abs_time_feats[domain] = device_batch.get(
+            f'{domain}_abs_time_feats',
+            torch.zeros(B, 3, L, dtype=torch.long, device=device))
 
     return ModelInput(
         user_int_feats=device_batch['user_int_feats'],
@@ -300,6 +304,7 @@ def _batch_to_model_input(
         seq_data=seq_data,
         seq_lens=seq_lens,
         seq_time_buckets=seq_time_buckets,
+        seq_abs_time_feats=seq_abs_time_feats,
     )
 
 
@@ -373,11 +378,11 @@ def main() -> None:
             f"The directory contains: {os.listdir(model_dir) if model_dir and os.path.isdir(model_dir) else 'N/A'}. "
             "This typically means the training job wrote only the sidecar "
             "files (schema.json / train_config.json) for this step but did "
-            "not persist model.pt — a symptom of a race between "
+            "not persist model.pt; a symptom of a race between "
             "_remove_old_best_dirs and EarlyStopping.save_checkpoint."
         )
     logging.info(f"Loading checkpoint from {ckpt_path}")
-    load_model_state_strict(model, ckpt_path, device)
+    load_model_state_strict(model, ckpt_path, device) 
     model.eval()
     logging.info("Model loaded successfully")
 

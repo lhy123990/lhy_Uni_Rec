@@ -342,7 +342,7 @@ class PCVRParquetDataset(IterableDataset):
             max_len = self._seq_maxlen[domain]
             n_feats = len(self.sideinfo_fids[domain])
             self._buf_seq[domain] = np.zeros((B, n_feats, max_len), dtype=np.int64)
-            self._buf_seq_tb[domain] = np.zeros((B, max_len), dtype=np.int64)
+            self._buf_seq_tb[domain] = np.zeros((B, 4, max_len), dtype=np.int64)
             self._buf_seq_lens[domain] = np.zeros(B, dtype=np.int64)
 
         # ---- Pre-compute (col_idx, offset, vocab_size) plans for int columns ----
@@ -765,41 +765,56 @@ class PCVRParquetDataset(IterableDataset):
                 ts_col = batch.column(ts_ci)
                 ts_offs = ts_col.offsets.to_numpy()
                 ts_vals = ts_col.values.to_numpy()
-                if _NUMBA_AVAILABLE:
-                    _numba_fill_time_bucket(
-                        ts_offs, ts_vals, timestamps, BUCKET_BOUNDARIES,
-                        max_len, B, time_bucket)
-                else:
-                    # Pad timestamps into shape (B, max_len).
-                    ts_padded = np.zeros((B, max_len), dtype=np.int64)
-                    for i in range(B):
-                        s = int(ts_offs[i])
-                        e = int(ts_offs[i + 1])
-                        rl = e - s
-                        if rl <= 0:
-                            continue
-                        ul = min(rl, max_len)
-                        ts_padded[i, :ul] = ts_vals[s:s + ul]
+                ts_padded = np.zeros((B, max_len), dtype=np.int64)
+                for i in range(B):
+                    s = int(ts_offs[i])
+                    e = int(ts_offs[i + 1])
+                    rl = e - s
+                    if rl <= 0:
+                        continue
+                    ul = min(rl, max_len)
+                    ts_padded[i, :ul] = ts_vals[s:s + ul]
 
-                    ts_expanded = timestamps.reshape(-1, 1)
-                    time_diff = np.maximum(ts_expanded - ts_padded, 0)
-                    # np.searchsorted returns values in [0, len(BUCKET_BOUNDARIES)].
-                    # After +1 the nominal range is [1, len(BUCKET_BOUNDARIES)+1];
-                    # the upper bound only appears when time_diff exceeds the
-                    # largest boundary (~1 year) and would index past
-                    # nn.Embedding(NUM_TIME_BUCKETS=len(BUCKET_BOUNDARIES)+1).
-                    # Clip raw result to [0, len(BUCKET_BOUNDARIES)-1] so the final
-                    # bucket id (after +1) stays within [1, len(BUCKET_BOUNDARIES)]
-                    # and is always a valid Embedding index. Time-diffs beyond the
-                    # largest boundary collapse into the last bucket.
-                    raw_buckets = np.clip(
-                        np.searchsorted(BUCKET_BOUNDARIES, time_diff.ravel()),
-                        0, len(BUCKET_BOUNDARIES) - 1,
-                    )
-                    buckets = raw_buckets.reshape(B, max_len) + 1
-                    buckets[ts_padded == 0] = 0
-                    time_bucket[:] = buckets
+                # Keep this path in numpy even when numba is available.
+                # _numba_fill_time_bucket is a legacy 2D kernel and does not
+                # match the new 4-channel layout (B, 4, L), which can crash
+                # DataLoader workers under multiprocessing.
+                ts_expanded = timestamps.reshape(-1, 1)
+                time_diff = np.maximum(ts_expanded - ts_padded, 0)
+                # np.searchsorted returns values in [0, len(BUCKET_BOUNDARIES)].
+                # After +1 the nominal range is [1, len(BUCKET_BOUNDARIES)+1];
+                # the upper bound only appears when time_diff exceeds the
+                # largest boundary (~1 year) and would index past
+                # nn.Embedding(NUM_TIME_BUCKETS=len(BUCKET_BOUNDARIES)+1).
+                # Clip raw result to [0, len(BUCKET_BOUNDARIES)-1] so the final
+                # bucket id (after +1) stays within [1, len(BUCKET_BOUNDARIES)]
+                # and is always a valid Embedding index. Time-diffs beyond the
+                # largest boundary collapse into the last bucket.
+                raw_buckets = np.clip(
+                    np.searchsorted(BUCKET_BOUNDARIES, time_diff.ravel()),
+                    0, len(BUCKET_BOUNDARIES) - 1,
+                )
+                buckets = raw_buckets.reshape(B, max_len) + 1
+                buckets[ts_padded == 0] = 0
+                time_bucket[:, 0, :] = buckets
 
+                ts_utc8 = ts_padded + 8 * 3600
+                hours = ((ts_utc8 % 86400) // 3600).astype(np.int64)
+                weekdays = (((ts_utc8 // 86400) + 4) % 7).astype(np.int64)
+                months = (
+                    ts_utc8.astype('datetime64[s]')
+                    .astype('datetime64[M]')
+                    .astype(np.int64)
+                    % 12
+                    + 1
+                ).astype(np.int64)
+                padded_mask = ts_padded == 0
+                hours[padded_mask] = 0
+                weekdays[padded_mask] = 0
+                months[padded_mask] = 0
+                time_bucket[:, 1, :] = hours
+                time_bucket[:, 2, :] = weekdays
+                time_bucket[:, 3, :] = months
             result[f'{domain}_time_bucket'] = torch.from_numpy(time_bucket.copy())
 
         return result

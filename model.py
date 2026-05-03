@@ -19,6 +19,7 @@ class ModelInput(NamedTuple):
     seq_data: dict        # {domain: tensor [B, S, L]}
     seq_lens: dict        # {domain: tensor [B]}
     seq_time_buckets: dict  # {domain: tensor [B, L]}
+    seq_abs_time_feats: dict  # {domain: tensor [B, 3, L]} - hour/weekday/month
 
 
 @dataclass(frozen=True)
@@ -1465,6 +1466,11 @@ class PCVRHyFormer(nn.Module):
                 sparse=sparse_embeddings,
             )
 
+        # ================== Absolute Time Embeddings ==================
+        self.hour_embedding = nn.Embedding(24 + 1, d_model, padding_idx=0)
+        self.weekday_embedding = nn.Embedding(7 + 1, d_model, padding_idx=0)
+        self.month_embedding = nn.Embedding(12 + 1, d_model, padding_idx=0)
+
         # ================== HyFormer Components ==================
         # MultiSeqQueryGenerator
         self.query_generator = MultiSeqQueryGenerator(
@@ -1554,6 +1560,10 @@ class PCVRHyFormer(nn.Module):
         if self.num_time_buckets > 0:
             nn.init.xavier_normal_(self.time_embedding.weight.data)
             self.time_embedding.weight.data[0, :] = 0
+
+        for emb in [self.hour_embedding, self.weekday_embedding, self.month_embedding]:
+            nn.init.xavier_normal_(emb.weight.data)
+            emb.weight.data[0, :] = 0
 
     def reinit_high_cardinality_params(
         self, cardinality_threshold: int = 10000
@@ -1655,9 +1665,22 @@ class PCVRHyFormer(nn.Module):
         cat_emb = torch.cat(emb_list, dim=-1)  # (B, L, S*emb_dim)
         token_emb = F.gelu(proj(cat_emb))  # (B, L, D)
 
-        # Add time bucket embedding (all-zero ids produce zero vectors via padding_idx=0)
+        # Add time bucket embedding and absolute time embeddings.
+        # Expected shape from dataset: (B, 4, L)
+        if time_bucket_ids.dim() == 2:
+            time_bucket_ids = time_bucket_ids.unsqueeze(1)
+
+        time_bucket_token_ids = time_bucket_ids[:, 0, :]
         if self.num_time_buckets > 0:
-            token_emb = token_emb + self.time_embedding(time_bucket_ids)
+            token_emb = token_emb + self.time_embedding(time_bucket_token_ids)
+
+        if time_bucket_ids.size(1) > 1:
+            hour_ids = time_bucket_ids[:, 1, :]
+            weekday_ids = time_bucket_ids[:, 2, :]
+            month_ids = time_bucket_ids[:, 3, :]
+            token_emb = token_emb + self.hour_embedding(hour_ids)
+            token_emb = token_emb + self.weekday_embedding(weekday_ids)
+            token_emb = token_emb + self.month_embedding(month_ids)
 
         return token_emb
 
