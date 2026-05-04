@@ -34,9 +34,9 @@ class ActivationCheckpointConfig:
     units: Tuple[str, ...] = ()
 
 
-# ══════════════════════════════════════════════════════════════════════════════�?
+# ══════════════════════════════════════════════════════════════════════════════�?
 # Rotary Position Embedding (RoPE)
-# ══════════════════════════════════════════════════════════════════════════════�?
+# ══════════════════════════════════════════════════════════════════════════════�?
 
 
 class RotaryEmbedding(nn.Module):
@@ -108,9 +108,9 @@ def apply_rope_to_tensor(
     return x * cos_ + rotate_half(x) * sin_
 
 
-# ══════════════════════════════════════════════════════════════════════════════�?
+# ══════════════════════════════════════════════════════════════════════════════�?
 # HyFormer Basic Components
-# ══════════════════════════════════════════════════════════════════════════════�?
+# ══════════════════════════════════════════════════════════════════════════════�?
 
 
 class SwiGLU(nn.Module):
@@ -420,7 +420,7 @@ class RankMixerBlock(nn.Module):
                 )
             self.d_sub = d_model // n_total
 
-        # Per-token FFN (shared parameters) �? used by both 'full' and 'ffn_only'
+        # Per-token FFN (shared parameters) �? used by both 'full' and 'ffn_only'
         self.norm = RMSNorm(d_model)
         self.fc1 = nn.Linear(d_model, d_model * hidden_mult)
         self.fc2 = nn.Linear(d_model * hidden_mult, d_model)
@@ -568,9 +568,9 @@ class MultiSeqQueryGenerator(nn.Module):
         return q_tokens_list
 
 
-# ══════════════════════════════════════════════════════════════════════════════�?
+# ══════════════════════════════════════════════════════════════════════════════�?
 # Sequence Encoders
-# ══════════════════════════════════════════════════════════════════════════════�?
+# ══════════════════════════════════════════════════════════════════════════════�?
 
 
 class SwiGLUEncoder(nn.Module):
@@ -918,9 +918,9 @@ def create_sequence_encoder(
         raise ValueError(f"Unknown encoder type: {encoder_type}")
 
 
-# ══════════════════════════════════════════════════════════════════════════════�?
+# ══════════════════════════════════════════════════════════════════════════════�?
 # HyFormer Blocks
-# ══════════════════════════════════════════════════════════════════════════════�?
+# ══════════════════════════════════════════════════════════════════════════════�?
 
 
 class MultiSeqHyFormerBlock(nn.Module):
@@ -1088,9 +1088,9 @@ class MultiSeqHyFormerBlock(nn.Module):
         return next_q_list, next_ns, next_seqs, next_masks
 
 
-# ══════════════════════════════════════════════════════════════════════════════�?
+# ══════════════════════════════════════════════════════════════════════════════�?
 # PCVRHyFormer Main Model
-# ══════════════════════════════════════════════════════════════════════════════�?
+# ══════════════════════════════════════════════════════════════════════════════�?
 
 
 class GroupNSTokenizer(nn.Module):
@@ -1272,7 +1272,7 @@ class RankMixerNSTokenizer(nn.Module):
         Returns:
             (B, num_ns_tokens, d_model) tensor.
         """
-        # 1. Embed all fids in group order �? flat cat
+        # 1. Embed all fids in group order �? flat cat
         all_embs = []
         for group in self.groups:
             for fid_idx in group:
@@ -1392,7 +1392,7 @@ class PCVRHyFormer(nn.Module):
             )
             num_item_ns = len(item_ns_groups)
         elif ns_tokenizer_type == 'rankmixer':
-            # RankMixer paper style: all embeddings cat �? split �? project
+            # RankMixer paper style: all embeddings cat �? split �? project
             # 0 means auto: fall back to group count
             if user_ns_tokens <= 0:
                 user_ns_tokens = len(user_ns_groups)
@@ -1645,7 +1645,7 @@ class PCVRHyFormer(nn.Module):
                     reinit_count += 1
                 else:
                     skip_count += 1
-
+ 
         for tokenizer, specs in [
             (self.user_ns_tokenizer, self.user_ns_tokenizer.feature_specs),
             (self.item_ns_tokenizer, self.item_ns_tokenizer.feature_specs),
