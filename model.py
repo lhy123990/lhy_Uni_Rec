@@ -1675,7 +1675,7 @@ class PCVRHyFormer(nn.Module):
             time_emb_list.append(self.time_embedding(time_bucket_token_ids))
         else:
             time_emb_list.append(seq.new_zeros(B, L, self.emb_dim, dtype=torch.float))
-  
+   
         if time_bucket_ids.size(1) > 1:
             hour_ids = time_bucket_ids[:, 1, :]
             weekday_ids = time_bucket_ids[:, 2, :]
