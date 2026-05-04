@@ -34,9 +34,9 @@ class ActivationCheckpointConfig:
     units: Tuple[str, ...] = ()
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════════════════�?
 # Rotary Position Embedding (RoPE)
-# ═══════════════════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════════════════�?
 
 
 class RotaryEmbedding(nn.Module):
@@ -108,9 +108,9 @@ def apply_rope_to_tensor(
     return x * cos_ + rotate_half(x) * sin_
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════════════════�?
 # HyFormer Basic Components
-# ═══════════════════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════════════════�?
 
 
 class SwiGLU(nn.Module):
@@ -161,6 +161,7 @@ class RoPEMultiheadAttention(nn.Module):
         num_heads: int,
         dropout: float = 0.0,
         rope_on_q: bool = True,
+        use_talking_head: bool = True
     ) -> None:
         super().__init__()
         self.d_model = d_model
@@ -168,6 +169,7 @@ class RoPEMultiheadAttention(nn.Module):
         self.head_dim = d_model // num_heads
         self.rope_on_q = rope_on_q
         self.dropout = dropout
+        self.use_talking_head = use_talking_head
 
         assert d_model % num_heads == 0, "d_model must be divisible by num_heads"
 
@@ -177,6 +179,17 @@ class RoPEMultiheadAttention(nn.Module):
         self.W_o = nn.Linear(d_model, d_model)
         self.W_g = nn.Linear(d_model, d_model)
 
+        # Talking-Heads projections across attention heads.
+        # th_logits mixes heads before softmax.
+        # th_probs mixes heads after softmax.
+        #talking head projections
+        if self.use_talking_head:
+            self.th_logits = nn.Parameter(torch.eye(num_heads))
+            self.th_probs = nn.Parameter(torch.eye(num_heads))
+        else:
+            self.register_parameter("th_logits", None)
+            self.register_parameter("th_probs", None)
+        
         nn.init.zeros_(self.W_g.weight)
         nn.init.constant_(self.W_g.bias, 1.0)
 
@@ -255,11 +268,38 @@ class RoPEMultiheadAttention(nn.Module):
 
         # 5. Scaled Dot-Product Attention
         dropout_p = self.dropout if self.training else 0.0
-        out = F.scaled_dot_product_attention(
-            Q, K, V,
-            attn_mask=sdpa_attn_mask,
-            dropout_p=dropout_p,
-        )  # (B, num_heads, Lq, head_dim)
+
+        if not self.use_talking_head:
+            out = F.scaled_dot_product_attention(
+                Q, K, V,
+                attn_mask=sdpa_attn_mask,
+                dropout_p=dropout_p,
+            )
+        else:
+            attn_logits = torch.matmul(Q, K.transpose(-2, -1)) / math.sqrt(self.head_dim)
+
+            attn_logits = torch.einsum(
+                "b h q k, h g -> b g q k",
+                attn_logits,
+                self.th_logits,
+            )
+
+            if sdpa_attn_mask is not None:
+                attn_logits = attn_logits.masked_fill(~sdpa_attn_mask, float("-inf"))
+
+            attn_probs = torch.softmax(attn_logits, dim=-1)
+            attn_probs = torch.nan_to_num(attn_probs, nan=0.0)
+
+            attn_probs = torch.einsum(
+                "b h q k, h g -> b g q k",
+                attn_probs,
+                self.th_probs,
+            )
+
+            if dropout_p > 0.0:
+                attn_probs = F.dropout(attn_probs, p=dropout_p, training=True)
+
+            out = torch.matmul(attn_probs, V)
 
         # Replace NaN from all-padding softmax with 0 (zero vectors preserve original input via residual)
         out = torch.nan_to_num(out, nan=0.0)
@@ -295,6 +335,7 @@ class CrossAttention(nn.Module):
             num_heads=num_heads,
             dropout=dropout,
             rope_on_q=False,
+            use_talking_head=True
         )
 
         if ln_mode in ['pre', 'post']:
@@ -379,7 +420,7 @@ class RankMixerBlock(nn.Module):
                 )
             self.d_sub = d_model // n_total
 
-        # Per-token FFN (shared parameters) — used by both 'full' and 'ffn_only'
+        # Per-token FFN (shared parameters) �? used by both 'full' and 'ffn_only'
         self.norm = RMSNorm(d_model)
         self.fc1 = nn.Linear(d_model, d_model * hidden_mult)
         self.fc2 = nn.Linear(d_model * hidden_mult, d_model)
@@ -503,7 +544,8 @@ class MultiSeqQueryGenerator(nn.Module):
             List of (B, Nq, D) query token tensors, length S.
         """
         B = ns_tokens.shape[0]
-        ns_flat = ns_tokens.view(B, -1)  # (B, M*D)
+        ns_flat = ns_tokens.detach().reshape(B, -1)  # (B, M*D)
+        # ns_flat = ns_tokens.view(B, -1)  # (B, M*D)
 
         q_tokens_list = []
         for i in range(self.num_sequences):
@@ -526,9 +568,9 @@ class MultiSeqQueryGenerator(nn.Module):
         return q_tokens_list
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════════════════�?
 # Sequence Encoders
-# ═══════════════════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════════════════�?
 
 
 class SwiGLUEncoder(nn.Module):
@@ -595,6 +637,7 @@ class TransformerEncoder(nn.Module):
             num_heads=num_heads,
             dropout=dropout,
             rope_on_q=True,
+            use_talking_head=False
         )
 
         hidden_dim = d_model * hidden_mult
@@ -684,6 +727,7 @@ class LongerEncoder(nn.Module):
             num_heads=num_heads,
             dropout=dropout,
             rope_on_q=True,
+            use_talking_head=False
         )
 
         # FFN (Pre-RMSNorm + residual)
@@ -874,9 +918,9 @@ def create_sequence_encoder(
         raise ValueError(f"Unknown encoder type: {encoder_type}")
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════════════════�?
 # HyFormer Blocks
-# ═══════════════════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════════════════�?
 
 
 class MultiSeqHyFormerBlock(nn.Module):
@@ -1044,9 +1088,9 @@ class MultiSeqHyFormerBlock(nn.Module):
         return next_q_list, next_ns, next_seqs, next_masks
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════════════════�?
 # PCVRHyFormer Main Model
-# ═══════════════════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════════════════�?
 
 
 class GroupNSTokenizer(nn.Module):
@@ -1228,7 +1272,7 @@ class RankMixerNSTokenizer(nn.Module):
         Returns:
             (B, num_ns_tokens, d_model) tensor.
         """
-        # 1. Embed all fids in group order → flat cat
+        # 1. Embed all fids in group order �? flat cat
         all_embs = []
         for group in self.groups:
             for fid_idx in group:
@@ -1348,7 +1392,7 @@ class PCVRHyFormer(nn.Module):
             )
             num_item_ns = len(item_ns_groups)
         elif ns_tokenizer_type == 'rankmixer':
-            # RankMixer paper style: all embeddings cat → split → project
+            # RankMixer paper style: all embeddings cat �? split �? project
             # 0 means auto: fall back to group count
             if user_ns_tokens <= 0:
                 user_ns_tokens = len(user_ns_groups)
@@ -1691,6 +1735,7 @@ class PCVRHyFormer(nn.Module):
         token_emb = F.gelu(proj(cat_emb))  # (B, L, D)
 
         return token_emb
+
 
     def _make_padding_mask(
         self, seq_len: torch.Tensor, max_len: int
