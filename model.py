@@ -1644,7 +1644,7 @@ class PCVRHyFormer(nn.Module):
                     reinit_ptrs.add(emb.weight.data_ptr())
                     reinit_count += 1
                 else:
-                    skip_count += 1
+                    skip_count += 1 
  
         for tokenizer, specs in [
             (self.user_ns_tokenizer, self.user_ns_tokenizer.feature_specs),
