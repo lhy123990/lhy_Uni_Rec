@@ -18,7 +18,13 @@ class ModelInput(NamedTuple):
     item_dense_feats: torch.Tensor
     seq_data: dict        # {domain: tensor [B, S, L]}
     seq_lens: dict        # {domain: tensor [B]}
-    seq_time_buckets: dict  # {domain: tensor [B, L]}
+    # Time features aligned with each sequence token.
+    # - seq_time_buckets: int ids, typically shape [B, C, L] (or [B, L] for legacy)
+    # - seq_time_cont_feats: float values, shape [B, 4, L] =>
+    #     [log_gap, delta_scaled, idle_scaled, session_flag]
+    seq_time_buckets: dict
+    seq_time_cont_feats: dict
+    # Legacy (kept for backward compatibility; not used in the current model path)
     seq_abs_time_feats: dict  # {domain: tensor [B, 3, L]} - hour/weekday/month
 
 
@@ -1498,7 +1504,10 @@ class PCVRHyFormer(nn.Module):
             self._seq_emb_index[domain] = idx_map
             self._seq_is_id[domain] = is_id
             self._seq_vocab_sizes[domain] = vs
-            seq_input_dim = (len(vs) + 4) * emb_dim
+            # Concatenate: side-info embeddings + time feature embeddings.
+            # Time features currently contribute 5 vectors at emb_dim each:
+            #   [bucket_id_emb, hour_emb, weekday_emb, month_emb, cont_time_proj]
+            seq_input_dim = (len(vs) + 5) * emb_dim
             self._seq_proj[domain] = nn.Sequential(
                 nn.Linear(seq_input_dim, d_model),
                 RMSNorm(d_model),
@@ -1515,6 +1524,15 @@ class PCVRHyFormer(nn.Module):
         self.hour_embedding = nn.Embedding(24 + 1, emb_dim, padding_idx=0)
         self.weekday_embedding = nn.Embedding(7 + 1, emb_dim, padding_idx=0)
         self.month_embedding = nn.Embedding(12 + 1, emb_dim, padding_idx=0)
+
+        # ================== Continuous Time Feature Projection ==================
+        # Keep bias=False so padded zeros stay exactly zero.
+        # Input channels: [log_gap, delta_scaled, idle_scaled, session_flag]
+        # Match dense-feature token style: Linear -> RMSNorm, then activation at call site.
+        self.time_cont_proj = nn.Sequential(
+            nn.Linear(4, emb_dim, bias=False),
+            RMSNorm(emb_dim),
+        )
 
         # ================== HyFormer Components ==================
         # MultiSeqQueryGenerator
@@ -1692,6 +1710,7 @@ class PCVRHyFormer(nn.Module):
         is_id: List[bool],
         emb_index: List[int],
         time_bucket_ids: torch.Tensor,
+        time_cont_feats: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Embeds a sequence domain by concatenating sideinfo embeddings and projecting to d_model."""
         B, S, L = seq.shape
@@ -1731,7 +1750,29 @@ class PCVRHyFormer(nn.Module):
             zero_time = seq.new_zeros(B, L, self.emb_dim, dtype=torch.float)
             time_emb_list.extend([zero_time, zero_time, zero_time])
 
-        cat_emb = torch.cat(emb_list + time_emb_list, dim=-1)  # (B, L, (S+4)*emb_dim)
+        # Continuous time features: expected shape (B, 4, L) =>
+        #   [log_gap, delta_scaled, idle_scaled, session_flag]
+        if time_cont_feats is None:
+            time_emb_list.append(seq.new_zeros(B, L, self.emb_dim, dtype=torch.float))
+        else:
+            if time_cont_feats.dim() == 2:
+                time_cont_feats = time_cont_feats.unsqueeze(1)
+
+            # Pad/truncate channel dim to 4.
+            c = int(time_cont_feats.size(1))
+            if c < 4:
+                pad = time_cont_feats.new_zeros(B, 4 - c, L)
+                time_cont_feats = torch.cat([time_cont_feats, pad], dim=1)
+            elif c > 4:
+                time_cont_feats = time_cont_feats[:, :4, :]
+
+            # Project per-token continuous features to emb_dim.
+            # (B, 4, L) -> (B, L, 4) -> Linear -> (B, L, emb_dim)
+            cont = self.time_cont_proj(time_cont_feats.float().transpose(1, 2))
+            cont = F.silu(cont)
+            time_emb_list.append(cont)
+
+        cat_emb = torch.cat(emb_list + time_emb_list, dim=-1)  # (B, L, (S+5)*emb_dim)
         token_emb = F.gelu(proj(cat_emb))  # (B, L, D)
 
         return token_emb
@@ -1969,7 +2010,8 @@ class PCVRHyFormer(nn.Module):
                 inputs.seq_data[domain],
                 self._seq_embs[domain], self._seq_proj[domain],
                 self._seq_is_id[domain], self._seq_emb_index[domain],
-                inputs.seq_time_buckets[domain])
+                inputs.seq_time_buckets[domain],
+                inputs.seq_time_cont_feats[domain])
             seq_tokens_list.append(tokens)
             mask = self._make_padding_mask(inputs.seq_lens[domain], inputs.seq_data[domain].shape[2])
             seq_masks_list.append(mask)
@@ -2013,7 +2055,8 @@ class PCVRHyFormer(nn.Module):
                 inputs.seq_data[domain],
                 self._seq_embs[domain], self._seq_proj[domain],
                 self._seq_is_id[domain], self._seq_emb_index[domain],
-                inputs.seq_time_buckets[domain])
+                inputs.seq_time_buckets[domain],
+                inputs.seq_time_cont_feats[domain])
             seq_tokens_list.append(tokens)
             mask = self._make_padding_mask(inputs.seq_lens[domain], inputs.seq_data[domain].shape[2])
             seq_masks_list.append(mask)

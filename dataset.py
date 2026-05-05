@@ -337,12 +337,16 @@ class PCVRParquetDataset(IterableDataset):
         self._buf_user_dense = np.zeros((B, self.user_dense_schema.total_dim), dtype=np.float32)
         self._buf_seq = {}
         self._buf_seq_tb = {}
+        self._buf_seq_tc = {}
         self._buf_seq_lens = {}
         for domain in self.seq_domains:
             max_len = self._seq_maxlen[domain]
             n_feats = len(self.sideinfo_fids[domain])
             self._buf_seq[domain] = np.zeros((B, n_feats, max_len), dtype=np.int64)
             self._buf_seq_tb[domain] = np.zeros((B, 4, max_len), dtype=np.int64)
+            # Continuous time features aligned with the sequence timeline.
+            # Shape: (B, 4, L) => [log_gap, delta_scaled, idle_scaled, session_flag]
+            self._buf_seq_tc[domain] = np.zeros((B, 4, max_len), dtype=np.float32)
             self._buf_seq_lens[domain] = np.zeros(B, dtype=np.int64)
 
         # ---- Pre-compute (col_idx, offset, vocab_size) plans for int columns ----
@@ -761,6 +765,8 @@ class PCVRParquetDataset(IterableDataset):
             # Time bucketing.
             time_bucket = self._buf_seq_tb[domain][:B]
             time_bucket[:] = 0
+            time_cont = self._buf_seq_tc[domain][:B]
+            time_cont[:] = 0
             if ts_ci is not None:
                 ts_col = batch.column(ts_ci)
                 ts_offs = ts_col.offsets.to_numpy()
@@ -815,7 +821,48 @@ class PCVRParquetDataset(IterableDataset):
                 time_bucket[:, 1, :] = hours
                 time_bucket[:, 2, :] = weekdays
                 time_bucket[:, 3, :] = months
+
+                # Extra continuous time features:
+                # (1) log_gap: log(1 + |t_i - t_{i-1}|)
+                # (2) delta_scaled: log(1 + (t_last - t_i) / tau), where t_last is
+                #     the most recent (max) timestamp within the sequence.
+                # (3) idle_scaled: log(1 + (t_now - t_last) / tau), where t_now is the
+                #     sample timestamp column (aligned with labels).
+                # (4) session_flag: 1 if the local gap exceeds a threshold.
+                # These features are kept in float space to preserve resolution.
+                prev_ts = np.roll(ts_padded, 1, axis=1)
+                prev_ts[:, 0] = ts_padded[:, 0]
+                time_gap = np.abs(ts_padded - prev_ts)
+                time_gap[:, 0] = 0
+                time_gap[padded_mask] = 0
+                log_gap = np.log1p(time_gap).astype(np.float32)
+
+                tau = 86400.0  # 1 day in seconds
+                last_ts = ts_padded.max(axis=1, keepdims=True)
+                delta_t = np.maximum(last_ts - ts_padded, 0)
+                delta_t[padded_mask] = 0
+                delta_scaled = np.log1p(delta_t / tau).astype(np.float32)
+
+                # idle_scaled is per-sample (per row), repeated across L.
+                # timestamps is the "current" timestamp for each sample.
+                now_ts = timestamps.reshape(-1, 1)
+                idle_t = np.maximum(now_ts - last_ts, 0)
+                idle_scaled = np.log1p(idle_t / tau).astype(np.float32)
+                idle_scaled = np.repeat(idle_scaled, max_len, axis=1)
+                idle_scaled[padded_mask] = 0
+
+                # Session boundary flag from local time_gap (seconds).
+                # A simple heuristic: gap > 30 minutes => new session.
+                session_threshold = 1800
+                session_flag = (time_gap > session_threshold).astype(np.float32)
+                session_flag[padded_mask] = 0
+
+                time_cont[:, 0, :] = log_gap
+                time_cont[:, 1, :] = delta_scaled
+                time_cont[:, 2, :] = idle_scaled
+                time_cont[:, 3, :] = session_flag
             result[f'{domain}_time_bucket'] = torch.from_numpy(time_bucket.copy())
+            result[f'{domain}_time_cont'] = torch.from_numpy(time_cont.copy())
 
         return result
 

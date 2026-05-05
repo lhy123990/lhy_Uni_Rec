@@ -579,6 +579,7 @@ class PCVRHyFormerRankingTrainer:
         seq_data: Dict[str, torch.Tensor] = {}
         seq_lens: Dict[str, torch.Tensor] = {}
         seq_time_buckets: Dict[str, torch.Tensor] = {}
+        seq_time_cont_feats: Dict[str, torch.Tensor] = {}
         seq_abs_time_feats: Dict[str, torch.Tensor] = {}
         for domain in seq_domains:
             seq_data[domain] = device_batch[domain]
@@ -587,7 +588,11 @@ class PCVRHyFormerRankingTrainer:
             L = device_batch[domain].shape[2]
             seq_time_buckets[domain] = device_batch.get(
                 f'{domain}_time_bucket',
-                torch.zeros(B, L, dtype=torch.long, device=self.device))
+                torch.zeros(B, 4, L, dtype=torch.long, device=self.device))
+            seq_time_cont_feats[domain] = device_batch.get(
+                f'{domain}_time_cont',
+                torch.zeros(B, 4, L, dtype=torch.float32, device=self.device),
+            )
             seq_abs_time_feats[domain] = device_batch.get(
                 f'{domain}_abs_time_feats',
                 torch.zeros(B, 3, L, dtype=torch.long, device=self.device),
@@ -600,6 +605,7 @@ class PCVRHyFormerRankingTrainer:
             seq_data=seq_data,
             seq_lens=seq_lens,
             seq_time_buckets=seq_time_buckets,
+            seq_time_cont_feats=seq_time_cont_feats,
             seq_abs_time_feats=seq_abs_time_feats,
         )
 
