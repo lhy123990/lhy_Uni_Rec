@@ -21,6 +21,7 @@ import random
 import sys
 import time
 import types
+from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import Any, Dict, Iterable, List, Tuple
 
@@ -30,8 +31,14 @@ import torch.nn.functional as F
 from sklearn.metrics import roc_auc_score
 
 from dataset import NUM_TIME_BUCKETS, PCVRParquetDataset
-from model import ModelInput, PCVRHyFormer, apply_rope_to_tensor
+from model import (
+    ActivationCheckpointConfig,
+    ModelInput,
+    PCVRHyFormer,
+    apply_rope_to_tensor,
+)
 from train import build_feature_specs
+from utils import sigmoid_focal_loss
 
 
 @dataclass
@@ -76,6 +83,39 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seq_max_lens", default="seq_a:256,seq_b:256,seq_c:512,seq_d:512")
     parser.add_argument("--log_dir", default="logs", help="Directory for benchmark reports")
     parser.add_argument("--json", action="store_true", help="Print machine-readable JSON only")
+    parser.add_argument(
+        "--amp_dtype",
+        choices=["bf16", "fp16", "fp32"],
+        default="fp32",
+        help="Autocast dtype for train/eval benchmark; fp32 disables autocast.",
+    )
+    parser.add_argument("--loss_type", choices=["bce", "focal"], default="bce")
+    parser.add_argument("--focal_alpha", type=float, default=0.1)
+    parser.add_argument("--focal_gamma", type=float, default=2.0)
+    parser.add_argument(
+        "--repeat_batch_to_size",
+        type=int,
+        default=0,
+        help="Synthetic benchmark helper: tile each training batch along dim 0 "
+             "until it reaches this many rows. Validation batches are kept unchanged.",
+    )
+    parser.add_argument(
+        "--variant",
+        choices=[
+            "baseline_all_param_clip",
+            "optimized_dense_clip",
+            "optimized_no_clip",
+            "sparse_embedding_grads",
+        ],
+        default=None,
+        help="Run only one training variant; default keeps the historical comparison set.",
+    )
+    parser.add_argument(
+        "--activation_checkpoint_mode",
+        choices=["none", "all_blocks", "all_seq_encoders", "custom"],
+        default="none",
+    )
+    parser.add_argument("--activation_checkpoint_units", default="")
     return parser.parse_args()
 
 
@@ -117,6 +157,45 @@ def parse_int_list(spec: str) -> List[int]:
     if not spec:
         return []
     return [int(x.strip()) for x in spec.split(",") if x.strip()]
+
+
+def resolve_amp_dtype(device: torch.device, amp_dtype: str) -> torch.dtype | None:
+    if device.type != "cuda" or amp_dtype == "fp32":
+        return None
+    if amp_dtype == "bf16":
+        if not torch.cuda.is_bf16_supported():
+            raise RuntimeError("bf16 AMP requested, but torch.cuda.is_bf16_supported() is False")
+        return torch.bfloat16
+    return torch.float16
+
+
+def autocast_context(device: torch.device, amp_dtype: torch.dtype | None):
+    if device.type != "cuda" or amp_dtype is None:
+        return nullcontext()
+    return torch.autocast(device_type="cuda", dtype=amp_dtype)
+
+
+def repeat_batch_rows(batch: Dict[str, Any], target_rows: int) -> Dict[str, Any]:
+    """Tile tensor rows in a CPU batch to synthesize a larger benchmark batch."""
+    if target_rows <= 0:
+        return batch
+
+    labels = batch.get("label")
+    if not isinstance(labels, torch.Tensor) or labels.dim() == 0:
+        return batch
+
+    rows = int(labels.shape[0])
+    if rows <= 0 or rows >= target_rows:
+        return batch
+
+    idx = torch.arange(target_rows, dtype=torch.long) % rows
+    repeated: Dict[str, Any] = {}
+    for key, value in batch.items():
+        if isinstance(value, torch.Tensor) and value.dim() > 0 and int(value.shape[0]) == rows:
+            repeated[key] = value.index_select(0, idx.to(value.device))
+        else:
+            repeated[key] = value
+    return repeated
 
 
 def load_train_valid_batches(
@@ -177,6 +256,8 @@ def build_model(
     sparse_embeddings: bool,
     device: torch.device,
     attention_chunk_size: int = 0,
+    activation_checkpoint_mode: str = "none",
+    activation_checkpoint_units: Tuple[str, ...] = (),
 ) -> PCVRHyFormer:
     user_ns_groups = [[i] for i in range(len(dataset.user_int_schema.entries))]
     item_ns_groups = [[i] for i in range(len(dataset.item_int_schema.entries))]
@@ -213,6 +294,12 @@ def build_model(
         user_ns_tokens=5,
         item_ns_tokens=2,
         sparse_embeddings=sparse_embeddings,
+    )
+    model.configure_activation_checkpointing(
+        ActivationCheckpointConfig(
+            mode=activation_checkpoint_mode,
+            units=activation_checkpoint_units,
+        )
     )
     if attention_chunk_size > 0:
         patch_chunked_transformer_attention(model, attention_chunk_size)
@@ -364,6 +451,32 @@ def batch_to_model_input(batch: Dict[str, Any], device: torch.device) -> Tuple[M
             t = t.to(dtype=dtype)
         return t.to(device, non_blocking=False)
 
+    seq_time_buckets: Dict[str, torch.Tensor] = {}
+    seq_time_cont_feats: Dict[str, torch.Tensor] = {}
+    seq_abs_time_feats: Dict[str, torch.Tensor] = {}
+    for domain in seq_domains:
+        B = batch[domain].shape[0]
+        L = batch[domain].shape[2]
+        seq_time_buckets[domain] = move(
+            batch.get(
+                f"{domain}_time_bucket",
+                torch.zeros(B, 4, L, dtype=torch.long),
+            )
+        )
+        seq_time_cont_feats[domain] = move(
+            batch.get(
+                f"{domain}_time_cont",
+                torch.zeros(B, 4, L, dtype=torch.float32),
+            ),
+            torch.float32,
+        )
+        seq_abs_time_feats[domain] = move(
+            batch.get(
+                f"{domain}_abs_time_feats",
+                torch.zeros(B, 3, L, dtype=torch.long),
+            )
+        )
+
     inputs = ModelInput(
         user_int_feats=move(batch["user_int_feats"]),
         item_int_feats=move(batch["item_int_feats"]),
@@ -371,7 +484,9 @@ def batch_to_model_input(batch: Dict[str, Any], device: torch.device) -> Tuple[M
         item_dense_feats=move(batch["item_dense_feats"], torch.float32),
         seq_data={d: move(batch[d]) for d in seq_domains},
         seq_lens={d: move(batch[f"{d}_len"]) for d in seq_domains},
-        seq_time_buckets={d: move(batch[f"{d}_time_bucket"]) for d in seq_domains},
+        seq_time_buckets=seq_time_buckets,
+        seq_time_cont_feats=seq_time_cont_feats,
+        seq_abs_time_feats=seq_abs_time_feats,
     )
     label = move(batch["label"], torch.float32)
     if device.type == "cuda":
@@ -394,6 +509,7 @@ def evaluate(
     model: PCVRHyFormer,
     cpu_batches: List[Dict[str, Any]],
     device: torch.device,
+    amp_dtype: torch.dtype | None,
 ) -> Tuple[float, float, float]:
     was_training = model.training
     model.eval()
@@ -403,8 +519,9 @@ def evaluate(
 
     with torch.no_grad():
         for inputs, label, _, _ in iter_device_batches(cpu_batches, device):
-            logits, _ = model.predict(inputs)
-            logits_list.append(logits.squeeze(-1).detach().cpu())
+            with autocast_context(device, amp_dtype):
+                logits, _ = model.predict(inputs)
+            logits_list.append(logits.squeeze(-1).float().detach().cpu())
             labels_list.append(label.detach().cpu())
 
     if device.type == "cuda":
@@ -443,6 +560,10 @@ def run_epoch(
     valid_batches: List[Dict[str, Any]],
     device: torch.device,
     dense_params: List[torch.nn.Parameter],
+    amp_dtype: torch.dtype | None,
+    loss_type: str,
+    focal_alpha: float,
+    focal_gamma: float,
 ) -> EpochResult:
     steps = 0
     rows = 0
@@ -466,8 +587,17 @@ def run_epoch(
             if sparse_optimizer is not None:
                 sparse_optimizer.zero_grad(set_to_none=True)
 
-        logits = model(inputs).squeeze(-1)
-        loss = F.binary_cross_entropy_with_logits(logits, label)
+        with autocast_context(device, amp_dtype):
+            logits = model(inputs).squeeze(-1)
+            if loss_type == "focal":
+                loss = sigmoid_focal_loss(
+                    logits,
+                    label,
+                    alpha=focal_alpha,
+                    gamma=focal_gamma,
+                )
+            else:
+                loss = F.binary_cross_entropy_with_logits(logits, label)
         loss.backward()
 
         if variant == "baseline_all_param_clip":
@@ -501,6 +631,7 @@ def run_epoch(
         model=model,
         cpu_batches=valid_batches,
         device=device,
+        amp_dtype=amp_dtype,
     )
 
     return EpochResult(
@@ -531,6 +662,12 @@ def run_variant(
     epochs: int,
     seed: int,
     attention_chunk_size: int = 0,
+    amp_dtype: torch.dtype | None = None,
+    loss_type: str = "bce",
+    focal_alpha: float = 0.1,
+    focal_gamma: float = 2.0,
+    activation_checkpoint_mode: str = "none",
+    activation_checkpoint_units: Tuple[str, ...] = (),
 ) -> List[EpochResult]:
     sparse_embeddings = variant == "sparse_embedding_grads"
     set_seed(seed)
@@ -539,6 +676,8 @@ def run_variant(
         sparse_embeddings=sparse_embeddings,
         device=device,
         attention_chunk_size=attention_chunk_size,
+        activation_checkpoint_mode=activation_checkpoint_mode,
+        activation_checkpoint_units=activation_checkpoint_units,
     )
     sparse_params = model.get_sparse_params()
     dense_params = model.get_dense_params()
@@ -557,6 +696,10 @@ def run_variant(
             valid_batches=valid_batches,
             device=device,
             dense_params=dense_params,
+            amp_dtype=amp_dtype,
+            loss_type=loss_type,
+            focal_alpha=focal_alpha,
+            focal_gamma=focal_gamma,
         )
 
     results = []
@@ -574,6 +717,10 @@ def run_variant(
                     valid_batches=valid_batches,
                     device=device,
                     dense_params=dense_params,
+                    amp_dtype=amp_dtype,
+                    loss_type=loss_type,
+                    focal_alpha=focal_alpha,
+                    focal_gamma=focal_gamma,
                 )
             )
 
@@ -642,6 +789,12 @@ def format_report(payload: Dict[str, Any]) -> str:
         f"Data: {payload['data_dir']} | "
         f"train_batches={payload['num_batches']} train_rows={payload['num_rows']} | "
         f"valid_batches={payload['num_valid_batches']} valid_rows={payload['num_valid_rows']}",
+        f"Synthetic repeat: repeat_batch_to_size={payload.get('repeat_batch_to_size', 0)} "
+        f"source_train_rows={payload.get('source_num_rows', payload['num_rows'])}",
+        f"Precision/Loss: amp_dtype={payload.get('amp_dtype', 'fp32')} "
+        f"loss_type={payload.get('loss_type', 'bce')}",
+        f"Activation checkpoint: mode={payload.get('activation_checkpoint_mode', 'none')} "
+        f"units={payload.get('activation_checkpoint_units', [])}",
     ]
     for summary in payload["summaries"]:
         chunk = int(summary.get("attention_chunk_size", 0))
@@ -862,6 +1015,12 @@ def main() -> None:
     if device.type == "cuda":
         torch.cuda.set_device(device)
         torch.backends.cudnn.benchmark = True
+    amp_dtype = resolve_amp_dtype(device, args.amp_dtype)
+    activation_checkpoint_units = tuple(
+        unit.strip()
+        for unit in args.activation_checkpoint_units.split(",")
+        if unit.strip()
+    )
 
     dataset, cpu_batches, valid_batches = load_train_valid_batches(
         data_dir=data_dir,
@@ -870,7 +1029,16 @@ def main() -> None:
         seq_max_lens=parse_seq_max_lens(args.seq_max_lens),
         valid_ratio=args.valid_ratio,
     )
-    if args.disable_dense_clip:
+    source_num_rows = sum(int(b["label"].numel()) for b in cpu_batches)
+    if args.repeat_batch_to_size > 0:
+        cpu_batches = [
+            repeat_batch_rows(batch, args.repeat_batch_to_size)
+            for batch in cpu_batches
+        ]
+
+    if args.variant is not None:
+        variant_specs = [(args.variant, 0)]
+    elif args.disable_dense_clip:
         variant_specs: List[Tuple[str, int]] = [("optimized_no_clip", 0)]
     else:
         variant_specs = [
@@ -896,6 +1064,12 @@ def main() -> None:
             epochs=args.epochs,
             seed=args.seed,
             attention_chunk_size=attention_chunk_size,
+            amp_dtype=amp_dtype,
+            loss_type=args.loss_type,
+            focal_alpha=args.focal_alpha,
+            focal_gamma=args.focal_gamma,
+            activation_checkpoint_mode=args.activation_checkpoint_mode,
+            activation_checkpoint_units=activation_checkpoint_units,
         )
         all_results[variant] = results
         summary = summarize(results)
@@ -935,9 +1109,17 @@ def main() -> None:
         "data_dir": data_dir,
         "num_batches": len(cpu_batches),
         "num_rows": sum(int(b["label"].numel()) for b in cpu_batches),
+        "source_num_rows": source_num_rows,
+        "repeat_batch_to_size": args.repeat_batch_to_size,
         "num_valid_batches": len(valid_batches),
         "num_valid_rows": sum(int(b["label"].numel()) for b in valid_batches),
         "attention_chunk_sizes": parse_int_list(args.attention_chunk_sizes),
+        "amp_dtype": args.amp_dtype,
+        "loss_type": args.loss_type,
+        "focal_alpha": args.focal_alpha,
+        "focal_gamma": args.focal_gamma,
+        "activation_checkpoint_mode": args.activation_checkpoint_mode,
+        "activation_checkpoint_units": activation_checkpoint_units,
         "summaries": summaries,
     }
 

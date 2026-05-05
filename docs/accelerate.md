@@ -192,6 +192,12 @@ TensorBoard scalar 检查：
   - `Precision/predict_embedding_mean`
   - `Precision/predict_embedding_var`
 
+Compile checkpoint 检查：
+
+- 使用 `--torch_compile` 训练后，加载 top-k checkpoint 到未 compile 的普通模型。
+- 结果：`orig_mod_keys=0`，`strict_load_ok=420`。
+- 说明：checkpoint key 未出现 compiled wrapper 常见的 `_orig_mod.` 前缀。
+
 训练冒烟配置：
 
 ```bash
@@ -225,6 +231,134 @@ conda run -n taac python train.py \
 | `fp32` | disabled | false | 0.6882 | 0.5406 | 0.4008 | 通过 |
 | `auto` | bf16 | false | 0.6844 | 0.5443 | 0.4011 | 通过 |
 | `fp16` | fp16 | true | 0.6847 | 0.5446 | 0.4012 | 通过 |
+
+`torch.compile` 对照测试：
+
+配置：
+
+```bash
+TRAIN_CKPT_PATH=/tmp/lhy_compile_<mode>_ckpt \
+TRAIN_LOG_PATH=/tmp/lhy_compile_<mode>_logs \
+TRAIN_TF_EVENTS_PATH=/tmp/lhy_compile_<mode>_tf \
+conda run -n taac python train.py \
+  --data_dir data_sample_1000 \
+  --batch_size 128 \
+  --num_epochs 2 \
+  --patience 10 \
+  --num_workers 0 \
+  --buffer_batches 0 \
+  --valid_ratio 0.1 \
+  --train_ratio 0.2 \
+  --ns_tokenizer_type rankmixer \
+  --user_ns_tokens 5 \
+  --item_ns_tokens 2 \
+  --num_queries 2 \
+  --ns_groups_json "" \
+  --emb_skip_threshold 1000000 \
+  --reinit_sparse_after_epoch 999 \
+  --amp_dtype auto \
+  --precision_log_every_n_steps 1 \
+  [--torch_compile]
+```
+
+结果：
+
+| Variant | AMP 解析 | Total wall | Epoch 1 train | Epoch 1 valid | Epoch 2 train | Epoch 2 valid | Final AUC | Final LogLoss |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| no compile | bf16 | 19.08s | 1.87s | 1.29s | 0.35s | 0.91s | 0.5754 | 0.4543 |
+| compile | bf16 | 189.06s | 116.96s | 46.53s | 2.18s | 2.31s | 0.5773 | 0.4569 |
+
+精度与稳定性对比：
+
+| Metric | no compile step 2 | compile step 2 |
+| --- | ---: | ---: |
+| `Loss/train` | 0.064077 | 0.065156 |
+| `AUC/valid` | 0.575432 | 0.577253 |
+| `LogLoss/valid` | 0.454279 | 0.456892 |
+| `Precision/train_logits_mean` | -1.119258 | -1.108437 |
+| `Precision/train_logits_var` | 0.015431 | 0.014248 |
+| `Precision/valid_logits_mean` | -0.842873 | -0.829501 |
+| `Precision/valid_logits_var` | 0.006273 | 0.006111 |
+| `Precision/predict_embedding_mean` | 0.183261 | 0.178464 |
+| `Precision/predict_embedding_var` | 0.966532 | 0.968251 |
+
+结论：
+
+- 当前小样本配置下，`torch.compile` 功能正常，但首次 compile 成本极高，整体 wall time 明显变慢。
+- compile 后第二轮 train/valid 已恢复到秒级，但仍没有看到稳定超过 no-compile 的收益。
+- AUC、LogLoss、logits 分布和 embedding 方差变化都在小样本波动范围内，没有观察到明显数值异常。
+- 线上长训练可以继续保留 `--torch_compile` 作为实验开关，但不建议默认开启。
+
+100 epoch compile 摊销测试：
+
+同样使用 `data_sample_1000`、`train_ratio=0.2`、`valid_ratio=0.1`、`batch_size=128`、
+`amp_dtype=auto`、`precision_log_every_n_steps=10`，分别运行 no-compile 与 compile 100 epoch。
+
+| Variant | AMP 解析 | Total wall | Avg wall/epoch | Stable epoch delta 11-100 | Final Loss | Final AUC | Final LogLoss |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| no compile | bf16 | 166.22s | 1.662s | 1.289s | 0.000193 | 0.606186 | 0.355815 |
+| compile | bf16 | 247.46s | 2.475s | 1.678s | 0.000183 | 0.601690 | 0.355288 |
+
+100 epoch 末尾稳定性指标：
+
+| Metric | no compile epoch 100 | compile epoch 100 |
+| --- | ---: | ---: |
+| `Precision/train_logits_mean` | -1.763906 | -1.762812 |
+| `Precision/train_logits_var` | 3.555210 | 3.599245 |
+| `Precision/valid_logits_mean` | -2.195169 | -2.185515 |
+| `Precision/valid_logits_var` | 0.625355 | 0.615524 |
+| `Precision/predict_embedding_mean` | 0.109735 | 0.115779 |
+| `Precision/predict_embedding_var` | 0.988355 | 0.986995 |
+
+100 epoch 结论：
+
+- 100 epoch 后 compile 总耗时仍慢于 no-compile：`247.46s` vs `166.22s`。
+- 排除前期冷启动后，compile 稳定期 epoch 间隔仍慢于 no-compile：`1.678s` vs `1.289s`。
+- compile 末尾 AUC 略低、LogLoss 略低，差异处于小样本随机波动范围内；未观察到 logits 或
+  embedding 分布异常。
+- 在当前 3090 小样本/小 batch 测试配置下，`torch.compile` 没有带来速度收益。线上 H20、
+  更大 batch、更长序列或更稳定 shape 时仍可单独复测，但当前不建议默认开启。
+
+Compile + gradient checkpoint 兼容性检查：
+
+```bash
+TRAIN_CKPT_PATH=/tmp/lhy_compile_gc_ckpt \
+TRAIN_LOG_PATH=/tmp/lhy_compile_gc_logs \
+TRAIN_TF_EVENTS_PATH=/tmp/lhy_compile_gc_tf \
+conda run -n taac python train.py \
+  --data_dir data_sample_1000 \
+  --batch_size 128 \
+  --num_epochs 2 \
+  --patience 10 \
+  --num_workers 0 \
+  --buffer_batches 0 \
+  --valid_ratio 0.1 \
+  --train_ratio 0.2 \
+  --ns_tokenizer_type rankmixer \
+  --user_ns_tokens 5 \
+  --item_ns_tokens 2 \
+  --num_queries 2 \
+  --ns_groups_json "" \
+  --emb_skip_threshold 1000000 \
+  --reinit_sparse_after_epoch 999 \
+  --amp_dtype auto \
+  --precision_log_every_n_steps 1 \
+  --torch_compile \
+  --activation_checkpoint_mode all_blocks
+```
+
+结果：
+
+| Test | Result |
+| --- | --- |
+| forward/backward | 通过 |
+| validation / `model.predict` | 通过 |
+| checkpoint save | 通过 |
+| checkpoint strict load 到未 compile 模型 | 通过，`orig_mod_keys=0`，`strict_load_ok=420` |
+| AMP 监控 scalar | 通过，训练/验证/predict embedding 指标均有记录 |
+
+兼容性测试耗时 `89.70s`。第 1 个 train step 主要消耗在 compile 冷启动，epoch 2 train
+恢复到秒级以内；`activation_checkpoint_mode=all_blocks` 与 `--torch_compile` 可同时工作。
 
 说明：
 

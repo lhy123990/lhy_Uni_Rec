@@ -276,3 +276,269 @@ optimized_no_clip: per_epoch_wall=1.376281s, val_auc=0.631629
   和 expanded mask 在同一权重、同一 batch 下 logits 完全一致。
 - logs 中的历史报告仅用于本地追踪，不应作为可复现实验的唯一来源；
   可复现入口是 `benchmark_gpu_epoch.py` 和本文档中的相对路径命令。
+
+## 7. Talking-Head Cross-Attention Triton Kernel 设计
+
+线上探测日志见 `docs/debug.md`。当前已实现 v2：Triton fused forward 已整合
+seeded dropout，custom autograd backward 也已切到 Triton kernel；不满足固定形状时
+仍回退到 PyTorch 参考实现。
+
+### 7.1 线上输入特征
+
+线上 batch 使用 `batch_size=768`，模型配置与 `run.sh` 的 RankMixer 路径一致：
+
+```text
+d_model=64, num_heads=4, head_dim=16, num_queries=2
+num_hyformer_blocks=2, seq_domains=seq_a/seq_b/seq_c/seq_d
+amp_dtype=bf16, use_rope=False, mask=key_padding
+```
+
+8 次 talking-head cross-attention 调用可以聚合成两类固定形状：
+
+| domains | calls | B | Lq | Lk | H | Dh | dtype | valid_len mean | rough temp |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | --- | ---: | ---: |
+| seq_a, seq_b | 4 | 768 | 2 | 256 | 4 | 16 | bf16 | 212.52 | 48.75 MiB |
+| seq_c, seq_d | 4 | 768 | 2 | 512 | 4 | 16 | bf16 | 416.05 | 96.75 MiB |
+
+单次调用的 Q/K/V 均为投影后的 transposed view：
+
+```text
+Q: (B, H, Lq, Dh), stride=[128, 16, 64, 1]
+K/V Lk=256: (B, H, Lk, Dh), stride=[16384, 16, 64, 1]
+K/V Lk=512: (B, H, Lk, Dh), stride=[32768, 16, 64, 1]
+```
+
+最后一维连续，适合 Triton 按 `Dh=16` 向量化加载。`seq_d` 大部分样本满长
+(`p25/p50/p75=512`)，但仍存在 `valid_len=0` 的全 padding 行；kernel 必须显式把
+全 padding 输出置零，不能依赖 softmax 后再 `nan_to_num`。
+
+### 7.2 当前分支的代价
+
+当前 `model.py` 中 talking-head 分支会依次执行：
+
+```text
+QK^T matmul
+logits head-mix einsum
+masked_fill
+softmax
+nan_to_num
+prob head-mix einsum
+dropout
+prob @ V matmul
+```
+
+在 `B=768` 的线上形状下，一次 forward 的 8 个 cross-attention 调用会产生约
+`145.5 MiB` 的 logits/probs 临时张量估算量，并触发多次小矩阵 kernel launch。
+由于 `Lq=2,H=4,Dh=16` 都很小，通用 matmul/einsum 很难把 launch 开销和中间
+tensor 写回成本摊平。
+
+### 7.3 Kernel 目标
+
+优先做一个专用 fused forward kernel，覆盖当前线上主路径：
+
+```text
+H=4, Dh=16, Lq=2, Lk in {256, 512}, dtype=bf16
+mask 仅支持 key_padding_mask，RoPE 在进入 kernel 前已处理
+th_logits/th_probs 按一般 dense 4x4 矩阵处理，不能假设 identity
+```
+
+Python wrapper 在不满足上述条件时回退到当前 PyTorch 实现。这样可以先把风险限制在
+线上已观测到的稳定形状内，后续再泛化。
+
+### 7.4 Forward Kernel 方案
+
+Triton grid 采用一个 program 处理一个 `(batch, query)`，也就是
+`grid=(B, Lq)`。每个 program 一次性处理全部 `H=4` heads 和完整 K 维：
+
+```text
+BLOCK_N = 256 或 512
+load Q[h, d]              -> (4, 16)
+load K[h, n, d]           -> (4, BLOCK_N, 16)
+logits_h[n] = dot(Q_h, K_h[n]) * rsqrt(16)
+mixed_logits_u[n] = sum_h logits_h[n] * th_logits[h, u]
+mask padding positions; if no valid key, store zero output
+softmax mixed_logits_u over n in fp32
+prob_g[n] = sum_u softmax_u[n] * th_probs[u, g]
+out_g[d] = sum_n prob_g[n] * V[g, n, d]
+store out as (B, H, Lq, Dh)
+```
+
+数值策略：
+
+- dot、head mixing、softmax 和 V accumulate 使用 fp32，store cast 回 bf16。
+- softmax 使用每个 mixed head 独立的 max/sum，和当前 `dim=-1` 语义一致。
+- padding mask 中 `True` 表示 padding；全 padding 行直接输出 0。
+- `th_logits` 和 `th_probs` 以 fp32 读取，支持训练后变成非单位矩阵。
+
+这个 kernel 可以消除 logits/probs/head-mix 中间张量写回，把单次调用的显式输出
+限制在 `(B,H,Lq,Dh)`，约 `0.1875 MiB`。相对当前分支，主要收益来自减少
+临时显存流量和 kernel launch 数量，而不是减少理论 FLOPs。
+
+### 7.5 Dropout 与 backward
+
+当前训练态 `dropout_rate=0.01`，dropout 位于第二次 head-mix 之后、乘 V 之前。
+实现参考 Triton low-memory dropout 教程：forward 不保存完整 dropout mask，只保存一个
+seed；backward 依据同一个 seed 和 `(B,H,Lq,Lk)` 线性 offset 再生成 keep mask。
+
+1. **v1: fused forward + seeded dropout，已实现**  
+   forward 在 Triton 内完成 attention、talking-head mixing、dropout 和 `@V`。若需要
+   autograd，custom `Function.backward` 会用保存的 seed 临时重建 keep mask，并通过
+   PyTorch 参考公式计算 `Q/K/V/th_logits/th_probs` 梯度。
+2. **v2: custom autograd training kernel，已实现**  
+   backward 在 Triton 内重算 logits、softmax、head-mix 和 deterministic dropout，
+   直接计算 `dQ/dK/dV/d_th_logits/d_th_probs`，避免 backward 阶段物化完整
+   `probs/keep_mask`。`dK/dV` 和 talking-head 参数梯度用 fp32 atomic accumulate，
+   返回给 `Q/K/V` 的梯度 cast 回输入 dtype，参数梯度保留参数 dtype。
+
+当前 v2 已覆盖训练态主路径。fixed fast path 条件仍是 `H=4,Dh=16,Lq=2,Lk in
+{256,512}`、`key_padding_mask`、`attn_mask=None`；其它输入继续走 PyTorch fallback。
+
+### 7.6 验收与 benchmark
+
+实现后先用独立等价测试覆盖：
+
+- `Lk=256/512`、`B` 包含小 batch 与 `768`。
+- `th_logits/th_probs` 分别测试 identity 和随机 dense 4x4。
+- `valid_len=0`、短序列、满长序列。
+- fp32 参考路径和 bf16 autocast 路径；bf16 输出建议以 `atol=3e-3, rtol=3e-3`
+  作为初始阈值，再根据实测收紧。
+
+benchmark 建议单独统计 talking-head 分支耗时和端到端 train step：
+
+```bash
+CUDA_VISIBLE_DEVICES=0 conda run -n taac python probe_talking_head_inputs.py \
+  --data_dir data_sample_1000 \
+  --device cuda:0 \
+  --batch_size 256 \
+  --max_batches 1
+```
+
+线上 benchmark 使用同样的模型参数和 `batch_size=768`。本地 `data_sample_1000`
+只有 100 行，真实端到端 batch 需要以上线日志为准。
+
+当前实现入口：
+
+- `talking_head_triton.py`：固定形状 Triton forward kernel、seeded dropout 和
+  custom autograd wrapper。
+- `model.py`：在 talking-head 分支中做 fast-path 判断和 PyTorch fallback。
+- 可用 `TALKING_HEAD_TRITON=0` 环境变量关闭 fast path 做 A/B 对比。
+
+### 7.7 Backward 实现验收记录
+
+2026-05-05 在 RTX 3090、torch `2.7.1+cu126`、bf16 mixed precision 下验证：
+
+| case | result |
+| --- | --- |
+| `python -m py_compile model.py talking_head_triton.py` | pass |
+| synthetic gradcheck, `B=4,Lk=256,p=0.11` | output max diff `0.0`；`dQ/dK/dV/d_th_logits/d_th_probs` max diff `[0.0, 3.05e-05, 1.22e-04, 9.54e-07, 4.77e-07]` |
+| synthetic gradcheck, `B=4,Lk=512,p=0.11` | output max diff `0.0`；`dQ/dK/dV/d_th_logits/d_th_probs` max diff `[0.0, 1.22e-04, 6.10e-05, 1.49e-06, 5.07e-07]` |
+| full-model smoke, requested `batch_size=768` | local sample actual `B=100`，loss `0.67348`，logits dtype `torch.bfloat16`，`grad_params=436` |
+
+核心算子 `B=768, H=4, Lq=2, Dh=16, dropout_p=0.01` 的 forward+backward 合成
+benchmark 如下；首轮 Triton JIT 编译不计入稳定结果：
+
+| Lk | Triton fwd+bwd | PyTorch reference | speedup |
+| ---: | ---: | ---: | ---: |
+| 256 | `2.7335 ms` | `4.9458 ms` | `1.81x` |
+| 512 | `5.2886 ms` | `9.8337 ms` | `1.86x` |
+
+### 7.8 真实训练 10 epoch A/B
+
+为贴近 `run.sh`，benchmark 已补齐当前 `ModelInput` 时间特征字段，并支持 bf16
+autocast 与 focal loss。A/B 只切换 `TALKING_HEAD_TRITON`，模型、seed、batch、
+loss、验证集划分保持一致：
+
+```bash
+CUDA_VISIBLE_DEVICES=0 TALKING_HEAD_TRITON=0 conda run -n taac python benchmark_gpu_efficiency.py \
+  --data_dir data_sample_1000 \
+  --schema_path data_sample_1000/schema.json \
+  --device cuda:0 \
+  --batch_size 768 \
+  --epochs 10 \
+  --repeats 1 \
+  --warmup_epochs 0 \
+  --variant optimized_dense_clip \
+  --attention_chunk_sizes '' \
+  --amp_dtype bf16 \
+  --loss_type focal \
+  --focal_alpha 0.5 \
+  --focal_gamma 2.0 \
+  --log_dir logs \
+  --json
+```
+
+本地只有 `data_sample_1000`，因此实际训练集为 `900` 行、验证集为 `100` 行，
+每 epoch `9` steps，10 epoch 共 `90` train steps。结果如下：
+
+| setting | total train wall | train wall / epoch | total train GPU | AUC | logloss | report |
+| --- | ---: | ---: | ---: | ---: | ---: | --- |
+| Triton off | `17.6116 s` | `1.7612 s` | `17.6096 s` | `0.638258` | `0.359549` | `logs/benchmark_gpu_epoch_20260505_173519.json` |
+| Triton on | `17.7010 s` | `1.7701 s` | `17.6990 s` | `0.649148` | `0.363688` | `logs/benchmark_gpu_epoch_20260505_173557.json` |
+
+端到端训练 wall 在这个小样本上为 `0.995x`，即慢 `0.51%`；AUC 差值为
+`+0.010890`。由于 dropout 随机源从 PyTorch dropout 切到 Triton seeded dropout，
+训练轨迹不会逐 bit 相同；在 100 行验证集上这个 AUC 差值只能作为 smoke 指标，
+不应解读为质量收益。
+
+如果扣除 benchmark 记录的 host-to-device 搬运 wall，模型训练计算段为：
+
+| setting | train wall - H2D | compute speedup |
+| --- | ---: | ---: |
+| Triton off | `16.2408 s` | baseline |
+| Triton on | `15.9703 s` | `1.017x` |
+
+结论：单个 talking-head fwd+bwd core 有约 `1.8x` 加速，但在当前全模型 10 epoch
+sample 训练中，这条路径只占总训练时间的一小段，端到端收益被数据搬运、embedding、
+self-attention、FFN、梯度裁剪和验证开销稀释。线上 batch 更稳定且数据量更大时，
+建议用同一命令在真实数据上复测；`TALKING_HEAD_TRITON=0/1` 可以直接做 A/B。
+
+### 7.9 复制样本后的 B=768 训练 A/B
+
+`benchmark_gpu_efficiency.py` 增加了 `--repeat_batch_to_size`：对每个训练 batch
+按 batch 维复制行到目标大小，验证集保持原始数据。这样本地 `data_sample_1000`
+也能让全模型 forward/backward 看到真实 `B=768` 形状。
+
+直接 `B=768` 在 RTX 3090 24GB 上会 OOM，且 OOM 发生在 sequence embedding /
+RMSNorm 阶段，早于 talking-head cross-attention。为完成本地 A/B，本次启用现有
+`--activation_checkpoint_mode all_blocks`，两边使用完全相同的 checkpoint 策略：
+
+```bash
+CUDA_VISIBLE_DEVICES=0 TALKING_HEAD_TRITON=0 conda run -n taac python benchmark_gpu_efficiency.py \
+  --data_dir data_sample_1000 \
+  --schema_path data_sample_1000/schema.json \
+  --device cuda:0 \
+  --batch_size 768 \
+  --repeat_batch_to_size 768 \
+  --epochs 10 \
+  --repeats 1 \
+  --warmup_epochs 0 \
+  --variant optimized_dense_clip \
+  --attention_chunk_sizes '' \
+  --amp_dtype bf16 \
+  --loss_type focal \
+  --focal_alpha 0.5 \
+  --focal_gamma 2.0 \
+  --activation_checkpoint_mode all_blocks \
+  --log_dir logs \
+  --json
+```
+
+训练集源数据仍是 900 行，复制后每 epoch 为 `9 × 768 = 6912` 行，10 epoch 共
+`90` train steps / `69120` synthetic rows；验证集保持 100 行：
+
+| setting | total train wall | train wall / epoch | total train GPU | AUC | logloss | report |
+| --- | ---: | ---: | ---: | ---: | ---: | --- |
+| Triton off | `57.8522 s` | `5.7852 s` | `57.8521 s` | `0.615530` | `0.384455` | `logs/benchmark_gpu_epoch_20260505_174900.json` |
+| Triton on | `58.2938 s` | `5.8294 s` | `58.2938 s` | `0.618845` | `0.387244` | `logs/benchmark_gpu_epoch_20260505_175019.json` |
+
+端到端训练 wall 为 `0.992x`，即开启 kernel 慢 `0.76%`。扣除 H2D 后的模型计算段：
+
+| setting | train wall - H2D | compute speedup |
+| --- | ---: | ---: |
+| Triton off | `50.5223 s` | baseline |
+| Triton on | `50.6747 s` | `0.997x` |
+
+这说明在当前全模型训练里，talking-head cross-attention 即使单核有收益，也不是主导
+耗时；复制到 `B=768` 后，全模型瓶颈仍更多落在长序列 embedding、self-attention、
+FFN 与 activation checkpoint 重算。AUC 差值 `+0.003314` 同样只作为 smoke 指标：
+验证集只有 100 行，且 Triton seeded dropout 与 PyTorch dropout 的随机轨迹不同。
