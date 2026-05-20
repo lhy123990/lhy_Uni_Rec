@@ -40,9 +40,9 @@ class ActivationCheckpointConfig:
     units: Tuple[str, ...] = ()
 
 
-# ══════════════════════════════════════════════════════════════════════════════�?
+# ══════════════════════════════════════════════════════════════════════════════�??
 # Rotary Position Embedding (RoPE)
-# ══════════════════════════════════════════════════════════════════════════════�?
+# ══════════════════════════════════════════════════════════════════════════════�??
 
 
 class RotaryEmbedding(nn.Module):
@@ -114,9 +114,9 @@ def apply_rope_to_tensor(
     return x * cos_ + rotate_half(x) * sin_
 
 
-# ══════════════════════════════════════════════════════════════════════════════�?
+# ══════════════════════════════════════════════════════════════════════════════�??
 # HyFormer Basic Components
-# ══════════════════════════════════════════════════════════════════════════════�?
+# ══════════════════════════════════════════════════════════════════════════════�??
 
 
 class SwiGLU(nn.Module):
@@ -426,7 +426,7 @@ class RankMixerBlock(nn.Module):
                 )
             self.d_sub = d_model // n_total
 
-        # Per-token FFN (shared parameters) �? used by both 'full' and 'ffn_only'
+        # Per-token FFN (shared parameters) �?? used by both 'full' and 'ffn_only'
         self.norm = RMSNorm(d_model)
         self.fc1 = nn.Linear(d_model, d_model * hidden_mult)
         self.fc2 = nn.Linear(d_model * hidden_mult, d_model)
@@ -504,13 +504,16 @@ class MultiSeqQueryGenerator(nn.Module):
         self,
         d_model: int,
         num_ns: int,
-        num_queries: int,
-        num_sequences: int,
+        num_queries_per_seq: Tuple[int, ...],
         hidden_mult: int = 4
     ) -> None:
         super().__init__()
-        self.num_queries = num_queries
-        self.num_sequences = num_sequences
+        if not num_queries_per_seq:
+            raise ValueError("num_queries_per_seq must be a non-empty tuple")
+        self.num_queries_per_seq = tuple(int(n) for n in num_queries_per_seq)
+        if any(n <= 0 for n in self.num_queries_per_seq):
+            raise ValueError(f"num_queries_per_seq must be all positive, got {self.num_queries_per_seq}")
+        self.num_sequences = len(self.num_queries_per_seq)
         self.d_model = d_model
 
         global_info_dim = (num_ns + 1) * d_model
@@ -527,9 +530,9 @@ class MultiSeqQueryGenerator(nn.Module):
                     nn.Linear(d_model * hidden_mult, d_model),
                     RMSNorm(d_model),
                 )
-                for _ in range(num_queries)
+                for _ in range(self.num_queries_per_seq[seq_idx])
             ])
-            for _ in range(num_sequences)
+            for seq_idx in range(self.num_sequences)
         ])
 
     def forward(
@@ -574,9 +577,9 @@ class MultiSeqQueryGenerator(nn.Module):
         return q_tokens_list
 
 
-# ══════════════════════════════════════════════════════════════════════════════�?
+# ══════════════════════════════════════════════════════════════════════════════�??
 # Sequence Encoders
-# ══════════════════════════════════════════════════════════════════════════════�?
+# ══════════════════════════════════════════════════════════════════════════════�??
 
 
 class SwiGLUEncoder(nn.Module):
@@ -924,9 +927,9 @@ def create_sequence_encoder(
         raise ValueError(f"Unknown encoder type: {encoder_type}")
 
 
-# ══════════════════════════════════════════════════════════════════════════════�?
+# ══════════════════════════════════════════════════════════════════════════════�??
 # HyFormer Blocks
-# ══════════════════════════════════════════════════════════════════════════════�?
+# ══════════════════════════════════════════════════════════════════════════════�??
 
 
 class MultiSeqHyFormerBlock(nn.Module):
@@ -941,7 +944,7 @@ class MultiSeqHyFormerBlock(nn.Module):
         self,
         d_model: int,
         num_heads: int,
-        num_queries: int,
+        num_queries_per_seq: Tuple[int, ...],
         num_ns: int,
         num_sequences: int,
         seq_encoder_type: str = 'swiglu',
@@ -953,7 +956,13 @@ class MultiSeqHyFormerBlock(nn.Module):
     ) -> None:
         super().__init__()
         self.num_sequences = num_sequences
-        self.num_queries = num_queries
+        if len(num_queries_per_seq) != num_sequences:
+            raise ValueError(
+                f"num_queries_per_seq must have length num_sequences={num_sequences}, got {len(num_queries_per_seq)}"
+            )
+        self.num_queries_per_seq = tuple(int(n) for n in num_queries_per_seq)
+        if any(n <= 0 for n in self.num_queries_per_seq):
+            raise ValueError(f"num_queries_per_seq must be all positive, got {self.num_queries_per_seq}")
         self.num_ns = num_ns
 
         # Independent sequence encoder per sequence
@@ -981,8 +990,8 @@ class MultiSeqHyFormerBlock(nn.Module):
             for _ in range(num_sequences)
         ])
 
-        # RankMixer: input token count = Nq * S + Nns
-        n_total = num_queries * num_sequences + num_ns
+        # RankMixer: input token count = sum(Nq_i) + Nns
+        n_total = sum(self.num_queries_per_seq) + num_ns
         self.mixer = RankMixerBlock(
             d_model=d_model,
             n_total=n_total,
@@ -1025,7 +1034,6 @@ class MultiSeqHyFormerBlock(nn.Module):
             and next_masks is a list of (B, L_i') updated padding masks.
         """
         S = self.num_sequences
-        Nq = self.num_queries
 
         # 1. Independent Sequence Evolution per sequence
         next_seqs = []
@@ -1078,25 +1086,26 @@ class MultiSeqHyFormerBlock(nn.Module):
             decoded_qs.append(decoded_q_i)
 
         # 3. Token Fusion: concatenate all decoded_q + ns_tokens
-        combined = torch.cat(decoded_qs + [ns_tokens], dim=1)  # (B, Nq*S + Nns, D)
+        combined = torch.cat(decoded_qs + [ns_tokens], dim=1)  # (B, sum(Nq_i) + Nns, D)
 
         # 4. Query Boosting
-        boosted = self.mixer(combined)  # (B, Nq*S + Nns, D)
+        boosted = self.mixer(combined)  # (B, sum(Nq_i) + Nns, D)
 
         # 5. Split back into per-sequence Q and NS
         next_q_list = []
         offset = 0
         for i in range(S):
-            next_q_list.append(boosted[:, offset:offset + Nq, :])
-            offset += Nq
+            n_q_i = self.num_queries_per_seq[i]
+            next_q_list.append(boosted[:, offset:offset + n_q_i, :])
+            offset += n_q_i
         next_ns = boosted[:, offset:, :]
 
         return next_q_list, next_ns, next_seqs, next_masks
 
 
-# ══════════════════════════════════════════════════════════════════════════════�?
+# ══════════════════════════════════════════════════════════════════════════════�??
 # PCVRHyFormer Main Model
-# ══════════════════════════════════════════════════════════════════════════════�?
+# ══════════════════════════════════════════════════════════════════════════════�??
 
 
 class GroupNSTokenizer(nn.Module):
@@ -1278,7 +1287,7 @@ class RankMixerNSTokenizer(nn.Module):
         Returns:
             (B, num_ns_tokens, d_model) tensor.
         """
-        # 1. Embed all fids in group order �? flat cat
+        # 1. Embed all fids in group order �?? flat cat
         all_embs = []
         for group in self.groups:
             for fid_idx in group:
@@ -1335,6 +1344,7 @@ class PCVRHyFormer(nn.Module):
         d_model: int = 64,
         emb_dim: int = 64,
         num_queries: int = 1,
+        num_queries_per_seq: Optional[List[int]] = None,
         num_hyformer_blocks: int = 2,
         num_heads: int = 4,
         seq_encoder_type: str = 'transformer',
@@ -1360,9 +1370,20 @@ class PCVRHyFormer(nn.Module):
         self.d_model = d_model
         self.emb_dim = emb_dim
         self.action_num = action_num
-        self.num_queries = num_queries
         self.seq_domains = sorted(seq_vocab_sizes.keys())  # deterministic order
         self.num_sequences = len(self.seq_domains)
+        if num_queries_per_seq is None:
+            self.num_queries_per_seq: Tuple[int, ...] = (int(num_queries),) * self.num_sequences
+        else:
+            if len(num_queries_per_seq) != self.num_sequences:
+                raise ValueError(
+                    f"num_queries_per_seq must have length num_sequences={self.num_sequences}, got {len(num_queries_per_seq)}"
+                )
+            self.num_queries_per_seq = tuple(int(n) for n in num_queries_per_seq)
+        if any(n <= 0 for n in self.num_queries_per_seq):
+            raise ValueError(f"num_queries_per_seq must be all positive, got {self.num_queries_per_seq}")
+        self.num_queries = int(num_queries)  # kept for backward compatibility / logging
+        self.num_query_tokens_total = sum(self.num_queries_per_seq)
         self.num_time_buckets = num_time_buckets
         self.rank_mixer_mode = rank_mixer_mode
         self.use_rope = use_rope
@@ -1398,7 +1419,7 @@ class PCVRHyFormer(nn.Module):
             )
             num_item_ns = len(item_ns_groups)
         elif ns_tokenizer_type == 'rankmixer':
-            # RankMixer paper style: all embeddings cat �? split �? project
+            # RankMixer paper style: all embeddings cat �?? split �?? project
             # 0 means auto: fall back to group count
             if user_ns_tokens <= 0:
                 user_ns_tokens = len(user_ns_groups)
@@ -1431,10 +1452,63 @@ class PCVRHyFormer(nn.Module):
         # User dense feature projection (if available)
         self.has_user_dense = user_dense_dim > 0
         if self.has_user_dense:
-            self.user_dense_proj = nn.Sequential(
-                nn.Linear(user_dense_dim, d_model),
-                RMSNorm(d_model),
+            # fid=61 (256d) + fid=87 (320d) => a standalone dense token:
+            #   concat -> L2 normalize -> Linear(576->64) -> LayerNorm
+            # Remaining user_dense features => still projected via user_dense_proj
+            # into another dense token.
+            # Expected user_dense layout (schema order):
+            #   61:256, 62:5, 63:11, 64:18, 65:49, 66:66, 87:320, ...
+            self._ud_fid61_offset = 0
+            self._ud_fid61_dim = 256
+            self._ud_fid87_offset = 256 + 6 + 19 + 26 + 111 + 150
+            self._ud_fid87_dim = 320
+            self._ud_compact_dim = 64
+            self._ud_l2_eps = 1e-12
+
+            self._enable_user_dense_61_87_compact = (
+                user_dense_dim >= (self._ud_fid87_offset + self._ud_fid87_dim)
             )
+            if self._enable_user_dense_61_87_compact:
+                self.user_dense_61_87_linear = nn.Linear(
+                    self._ud_fid61_dim + self._ud_fid87_dim,
+                    self._ud_compact_dim,
+                    RMSNorm(self._ud_compact_dim),
+                )
+                self.user_dense_61_87_ln = nn.LayerNorm(self._ud_compact_dim)
+
+                # Keep a stable token dimension for NS concatenation.
+                # If d_model != 64, we adapt with a lightweight projection.
+                if d_model == self._ud_compact_dim:
+                    self.user_dense_61_87_to_d_model = nn.Identity()
+                else:
+                    self.user_dense_61_87_to_d_model = nn.Linear(
+                        self._ud_compact_dim,
+                        d_model,
+                    )
+
+                rest_dim = user_dense_dim - self._ud_fid61_dim - self._ud_fid87_dim
+                self._has_user_dense_rest = rest_dim > 0
+                if self._has_user_dense_rest:
+                    self.user_dense_proj = nn.Sequential(
+                        nn.Linear(rest_dim, d_model),
+                        RMSNorm(d_model),
+                    )
+                else:
+                    self.user_dense_proj = None
+
+                self.num_user_dense_tokens = 1 + (1 if self._has_user_dense_rest else 0)
+            else:
+                self.user_dense_61_87_linear = None
+                self.user_dense_61_87_ln = None
+                self.user_dense_61_87_to_d_model = None
+                self._has_user_dense_rest = True
+                self.num_user_dense_tokens = 1
+                self.user_dense_proj = nn.Sequential(
+                    nn.Linear(user_dense_dim, d_model),
+                    RMSNorm(d_model),
+                )
+        else:
+            self.num_user_dense_tokens = 0
 
         # Item dense feature projection (if available)
         self.has_item_dense = item_dense_dim > 0
@@ -1445,16 +1519,16 @@ class PCVRHyFormer(nn.Module):
             )
 
         # Total NS token count
-        self.num_ns = (num_user_ns + (1 if self.has_user_dense else 0)
-                       + num_item_ns + (1 if self.has_item_dense else 0))
+        self.num_ns = (num_user_ns + self.num_user_dense_tokens
+                   + num_item_ns + (1 if self.has_item_dense else 0))
 
         # ================== Check d_model % T == 0 constraint (full mode only) ==================
-        T = num_queries * self.num_sequences + self.num_ns
+        T = self.num_query_tokens_total + self.num_ns
         if rank_mixer_mode == 'full' and d_model % T != 0:
             valid_T_values = [t for t in range(1, d_model + 1) if d_model % t == 0]
             raise ValueError(
-                f"d_model={d_model} must be divisible by T=num_queries*num_sequences+num_ns="
-                f"{num_queries}*{self.num_sequences}+{self.num_ns}={T}. "
+                f"d_model={d_model} must be divisible by T=sum(num_queries_per_seq)+num_ns="
+                f"{self.num_queries_per_seq}+{self.num_ns}={T}. "
                 f"Valid T values for d_model={d_model}: {valid_T_values}"
             )
 
@@ -1539,8 +1613,7 @@ class PCVRHyFormer(nn.Module):
         self.query_generator = MultiSeqQueryGenerator(
             d_model=d_model,
             num_ns=self.num_ns,
-            num_queries=num_queries,
-            num_sequences=self.num_sequences,
+            num_queries_per_seq=self.num_queries_per_seq,
             hidden_mult=hidden_mult,
         )
 
@@ -1549,7 +1622,7 @@ class PCVRHyFormer(nn.Module):
             MultiSeqHyFormerBlock(
                 d_model=d_model,
                 num_heads=num_heads,
-                num_queries=num_queries,
+                num_queries_per_seq=self.num_queries_per_seq,
                 num_ns=self.num_ns,
                 num_sequences=self.num_sequences,
                 seq_encoder_type=seq_encoder_type,
@@ -1571,7 +1644,7 @@ class PCVRHyFormer(nn.Module):
 
         # Output projection
         self.output_proj = nn.Sequential(
-            nn.Linear(num_queries * self.num_sequences * d_model, d_model),
+            nn.Linear(self.num_query_tokens_total * d_model, d_model),
             RMSNorm(d_model),
         )
 
@@ -1802,6 +1875,40 @@ class PCVRHyFormer(nn.Module):
             token = token.to(dtype=output_dtype)
         return token.unsqueeze(1)
 
+    def _extract_user_dense_rest(self, dense_feats: torch.Tensor) -> torch.Tensor:
+        return torch.cat(
+            [
+                dense_feats[:, self._ud_fid61_offset + self._ud_fid61_dim:self._ud_fid87_offset],
+                dense_feats[:, self._ud_fid87_offset + self._ud_fid87_dim:],
+            ],
+            dim=1,
+        )
+
+    def _project_user_dense_61_87_token(
+        self,
+        dense_feats: torch.Tensor,
+        output_dtype: torch.dtype,
+    ) -> torch.Tensor:
+        x61 = dense_feats[:, self._ud_fid61_offset:self._ud_fid61_offset + self._ud_fid61_dim]
+        x87 = dense_feats[:, self._ud_fid87_offset:self._ud_fid87_offset + self._ud_fid87_dim]
+        merged = torch.cat([x61, x87], dim=1)
+
+        if dense_feats.is_cuda:
+            with torch.autocast(device_type='cuda', enabled=False):
+                #token = F.normalize(merged.float(), p=2, dim=1, eps=self._ud_l2_eps)
+                token = self.user_dense_61_87_linear(merged)
+                #token = self.user_dense_61_87_ln(token)
+                token = self.user_dense_61_87_to_d_model(token)
+        else:
+            token = F.normalize(merged.float(), p=2, dim=1, eps=self._ud_l2_eps)
+            token = self.user_dense_61_87_linear(token)
+            token = self.user_dense_61_87_ln(token)
+            token = self.user_dense_61_87_to_d_model(token)
+
+        if token.dtype != output_dtype:
+            token = token.to(dtype=output_dtype)
+        return token.unsqueeze(1)
+
     def iter_activation_checkpoint_units(self) -> List[str]:
         """Returns stable activation checkpoint unit names.
 
@@ -1991,9 +2098,19 @@ class PCVRHyFormer(nn.Module):
 
         ns_parts = [user_ns]
         if self.has_user_dense:
-            user_dense_tok = self._project_dense_feature_token(
-                self.user_dense_proj, inputs.user_dense_feats, user_ns.dtype)
-            ns_parts.append(user_dense_tok)
+            if getattr(self, '_enable_user_dense_61_87_compact', False):
+                ud_61_87_tok = self._project_user_dense_61_87_token(
+                    inputs.user_dense_feats, user_ns.dtype)
+                ns_parts.append(ud_61_87_tok)
+                if getattr(self, '_has_user_dense_rest', False):
+                    ud_rest_feats = self._extract_user_dense_rest(inputs.user_dense_feats)
+                    ud_rest_tok = self._project_dense_feature_token(
+                        self.user_dense_proj, ud_rest_feats, user_ns.dtype)
+                    ns_parts.append(ud_rest_tok)
+            else:
+                user_dense_tok = self._project_dense_feature_token(
+                    self.user_dense_proj, inputs.user_dense_feats, user_ns.dtype)
+                ns_parts.append(user_dense_tok)
         ns_parts.append(item_ns)
         if self.has_item_dense:
             item_dense_tok = self._project_dense_feature_token(
@@ -2037,9 +2154,19 @@ class PCVRHyFormer(nn.Module):
 
         ns_parts = [user_ns]
         if self.has_user_dense:
-            user_dense_tok = self._project_dense_feature_token(
-                self.user_dense_proj, inputs.user_dense_feats, user_ns.dtype)
-            ns_parts.append(user_dense_tok)
+            if getattr(self, '_enable_user_dense_61_87_compact', False):
+                ud_61_87_tok = self._project_user_dense_61_87_token(
+                    inputs.user_dense_feats, user_ns.dtype)
+                ns_parts.append(ud_61_87_tok)
+                if getattr(self, '_has_user_dense_rest', False):
+                    ud_rest_feats = self._extract_user_dense_rest(inputs.user_dense_feats)
+                    ud_rest_tok = self._project_dense_feature_token(
+                        self.user_dense_proj, ud_rest_feats, user_ns.dtype)
+                    ns_parts.append(ud_rest_tok)
+            else:
+                user_dense_tok = self._project_dense_feature_token(
+                    self.user_dense_proj, inputs.user_dense_feats, user_ns.dtype)
+                ns_parts.append(user_dense_tok)
         ns_parts.append(item_ns)
         if self.has_item_dense:
             item_dense_tok = self._project_dense_feature_token(

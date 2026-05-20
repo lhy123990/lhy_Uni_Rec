@@ -56,7 +56,7 @@ def parse_args() -> argparse.Namespace:
                         help='Batch size for both training and validation')
     parser.add_argument('--lr', type=float, default=1e-4,
                         help='Learning rate for dense parameters (AdamW)')
-    parser.add_argument('--num_epochs', type=int, default=999,
+    parser.add_argument('--num_epochs', type=int, default=8,
                         help='Maximum number of training epochs '
                              '(typically terminated earlier by early stopping)')
     parser.add_argument('--patience', type=int, default=3,
@@ -103,6 +103,12 @@ def parse_args() -> argparse.Namespace:
                         help='Per-Embedding-table dimension (before projection)')
     parser.add_argument('--num_queries', type=int, default=1,
                         help='Number of Query tokens generated independently per sequence domain')
+    parser.add_argument('--num_queries_per_seq', type=str, default='',
+                        help='Optional per-sequence query token counts. '
+                             'Format either as a comma-separated list aligned to the model domain order '
+                             '(e.g. "1,1,2,2") or as domain:value pairs '
+                             '(e.g. "seq_a:1,seq_b:1,seq_c:2,seq_d:2"). '
+                             'When set, this overrides --num_queries for T and model shapes.')
     parser.add_argument('--num_hyformer_blocks', type=int, default=2,
                         help='Number of stacked MultiSeqHyFormerBlock layers')
     parser.add_argument('--num_heads', type=int, default=4,
@@ -293,6 +299,29 @@ def main() -> None:
         user_ns_groups = [[i] for i in range(len(pcvr_dataset.user_int_schema.entries))]
         item_ns_groups = [[i] for i in range(len(pcvr_dataset.item_int_schema.entries))]
 
+    # ---- Per-sequence query-token configuration (optional) ----
+    num_queries_per_seq = None
+    if getattr(args, 'num_queries_per_seq', ''):
+        raw = args.num_queries_per_seq.strip()
+        seq_domains = sorted(pcvr_dataset.seq_domain_vocab_sizes.keys())
+        if ':' in raw:
+            mapping = {}
+            for pair in raw.split(','):
+                if not pair.strip():
+                    continue
+                k, v = pair.split(':', 1)
+                mapping[k.strip()] = int(v.strip())
+            num_queries_per_seq = [mapping.get(d, int(args.num_queries)) for d in seq_domains]
+        else:
+            parts = [p.strip() for p in raw.split(',') if p.strip()]
+            num_queries_per_seq = [int(p) for p in parts]
+            if len(num_queries_per_seq) != len(seq_domains):
+                raise ValueError(
+                    f"--num_queries_per_seq list must have length {len(seq_domains)} (domains={seq_domains}), "
+                    f"got {len(num_queries_per_seq)} from '{raw}'"
+                )
+        logging.info(f"Per-sequence num_queries override: domains={seq_domains}, num_queries_per_seq={num_queries_per_seq}")
+
     # ---- Build model ----
     user_int_feature_specs = build_feature_specs(
         pcvr_dataset.user_int_schema, pcvr_dataset.user_int_vocab_sizes)
@@ -310,6 +339,7 @@ def main() -> None:
         "d_model": args.d_model,
         "emb_dim": args.emb_dim,
         "num_queries": args.num_queries,
+        "num_queries_per_seq": num_queries_per_seq,
         "num_hyformer_blocks": args.num_hyformer_blocks,
         "num_heads": args.num_heads,
         "seq_encoder_type": args.seq_encoder_type,
@@ -345,8 +375,14 @@ def main() -> None:
     # Log model sizing info.
     num_sequences = len(pcvr_dataset.seq_domains)
     num_ns = model.num_ns
-    T = args.num_queries * num_sequences + num_ns
-    logging.info(f"PCVRHyFormer model created: num_ns={num_ns}, T={T}, d_model={args.d_model}, rank_mixer_mode={args.rank_mixer_mode}")
+    if num_queries_per_seq is None:
+        T = args.num_queries * num_sequences + num_ns
+    else:
+        T = sum(num_queries_per_seq) + num_ns
+    logging.info(
+        f"PCVRHyFormer model created: num_ns={num_ns}, T={T}, d_model={args.d_model}, "
+        f"rank_mixer_mode={args.rank_mixer_mode}, num_queries_per_seq={num_queries_per_seq}"
+    )
     logging.info(f"User NS groups: {user_ns_groups}")
     logging.info(f"Item NS groups: {item_ns_groups}")
     total_params = sum(p.numel() for p in model.parameters())

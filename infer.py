@@ -51,6 +51,7 @@ _FALLBACK_MODEL_CFG = {
     'd_model': 64,
     'emb_dim': 64,
     'num_queries': 1,
+    'num_queries_per_seq': '',
     'num_hyformer_blocks': 2,
     'num_heads': 4,
     'seq_encoder_type': 'transformer',
@@ -220,6 +221,33 @@ def build_model(
     item_int_feature_specs = build_feature_specs(
         dataset.item_int_schema, dataset.item_int_vocab_sizes)
 
+    # Optional: parse per-sequence query-token counts.
+    num_queries_per_seq = None
+    raw_nq = str(model_cfg.get('num_queries_per_seq', '') or '').strip()
+    if raw_nq:
+        seq_domains = sorted(dataset.seq_domain_vocab_sizes.keys())
+        if ':' in raw_nq:
+            mapping: Dict[str, int] = {}
+            for pair in raw_nq.split(','):
+                if not pair.strip():
+                    continue
+                k, v = pair.split(':', 1)
+                mapping[k.strip()] = int(v.strip())
+            num_queries_per_seq = [mapping.get(d, int(model_cfg.get('num_queries', 1))) for d in seq_domains]
+        else:
+            parts = [p.strip() for p in raw_nq.split(',') if p.strip()]
+            num_queries_per_seq = [int(p) for p in parts]
+            if len(num_queries_per_seq) != len(seq_domains):
+                raise ValueError(
+                    f"num_queries_per_seq list must have length {len(seq_domains)} (domains={seq_domains}), "
+                    f"got {len(num_queries_per_seq)} from '{raw_nq}'"
+                )
+        logging.info(f"Resolved num_queries_per_seq: domains={seq_domains}, num_queries_per_seq={num_queries_per_seq}")
+
+    # Remove the raw string key so **model_cfg doesn't pass it as-is.
+    model_cfg = dict(model_cfg)
+    model_cfg.pop('num_queries_per_seq', None)
+
     logging.info(f"Building PCVRHyFormer with cfg: {model_cfg}")
     model = PCVRHyFormer(
         user_int_feature_specs=user_int_feature_specs,
@@ -229,6 +257,7 @@ def build_model(
         seq_vocab_sizes=dataset.seq_domain_vocab_sizes,
         user_ns_groups=user_ns_groups,
         item_ns_groups=item_ns_groups,
+        num_queries_per_seq=num_queries_per_seq,
         **model_cfg,
     ).to(device)
 
