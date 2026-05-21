@@ -81,6 +81,9 @@ _FALLBACK_NUM_WORKERS = 16
 _MODEL_CFG_KEYS = list(_FALLBACK_MODEL_CFG.keys())
 
 
+DEFAULT_SHARED_DENSE_FIDS = [62, 63, 64, 65, 66]
+
+
 def build_feature_specs(
     schema: FeatureSchema,
     per_position_vocab_sizes: List[int],
@@ -93,6 +96,28 @@ def build_feature_specs(
         vs = max(per_position_vocab_sizes[offset:offset + length])
         specs.append((vs, offset, length))
     return specs
+
+
+def build_user_int_dense_map(
+    user_int_schema: FeatureSchema,
+    user_dense_schema: FeatureSchema,
+    shared_fids: Optional[List[int]] = None,
+) -> List[Optional[Tuple[int, int]]]:
+    """Build mapping from user_int feature index to dense (offset, length).
+
+    Only fids in shared_fids are mapped, and only when dense length matches
+    the int feature length.
+    """
+    shared_set = set(shared_fids or [])
+    dense_by_fid = {fid: (offset, length) for fid, offset, length in user_dense_schema.entries}
+    mapping: List[Optional[Tuple[int, int]]] = []
+    for fid, _offset, length in user_int_schema.entries:
+        dense_info = dense_by_fid.get(fid)
+        if fid in shared_set and dense_info is not None and dense_info[1] == length:
+            mapping.append(dense_info)
+        else:
+            mapping.append(None)
+    return mapping
 
 
 def _parse_seq_max_lens(sml_str: str) -> Dict[str, int]:
@@ -252,6 +277,11 @@ def build_model(
     model = PCVRHyFormer(
         user_int_feature_specs=user_int_feature_specs,
         item_int_feature_specs=item_int_feature_specs,
+        user_int_dense_map=build_user_int_dense_map(
+            dataset.user_int_schema,
+            dataset.user_dense_schema,
+            DEFAULT_SHARED_DENSE_FIDS,
+        ),
         user_dense_dim=dataset.user_dense_schema.total_dim,
         item_dense_dim=dataset.item_dense_schema.total_dim,
         seq_vocab_sizes=dataset.seq_domain_vocab_sizes,

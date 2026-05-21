@@ -14,7 +14,7 @@ import json
 import argparse
 import logging
 from pathlib import Path
-from typing import List, Tuple
+from typing import List, Optional, Tuple
 
 import torch
 
@@ -22,6 +22,9 @@ from utils import set_seed, EarlyStopping, create_logger
 from dataset import FeatureSchema, get_pcvr_data, NUM_TIME_BUCKETS
 from model import ActivationCheckpointConfig, PCVRHyFormer
 from trainer import PCVRHyFormerRankingTrainer
+
+
+DEFAULT_SHARED_DENSE_FIDS = [62, 63, 64, 65, 66]
 
 
 def build_feature_specs(
@@ -36,6 +39,28 @@ def build_feature_specs(
         vs = max(per_position_vocab_sizes[offset:offset + length])
         specs.append((vs, offset, length))
     return specs
+
+
+def build_user_int_dense_map(
+    user_int_schema: FeatureSchema,
+    user_dense_schema: FeatureSchema,
+    shared_fids: Optional[List[int]] = None,
+) -> List[Optional[Tuple[int, int]]]:
+    """Build mapping from user_int feature index to dense (offset, length).
+
+    Only fids in shared_fids are mapped, and only when dense length matches
+    the int feature length.
+    """
+    shared_set = set(shared_fids or [])
+    dense_by_fid = {fid: (offset, length) for fid, offset, length in user_dense_schema.entries}
+    mapping: List[Optional[Tuple[int, int]]] = []
+    for fid, _offset, length in user_int_schema.entries:
+        dense_info = dense_by_fid.get(fid)
+        if fid in shared_set and dense_info is not None and dense_info[1] == length:
+            mapping.append(dense_info)
+        else:
+            mapping.append(None)
+    return mapping
 
 
 def parse_args() -> argparse.Namespace:
@@ -54,7 +79,7 @@ def parse_args() -> argparse.Namespace:
     # Training hyperparameters.
     parser.add_argument('--batch_size', type=int, default=256,
                         help='Batch size for both training and validation')
-    parser.add_argument('--lr', type=float, default=1e-4,
+    parser.add_argument('--lr', type=float, default=5e-4,
                         help='Learning rate for dense parameters (AdamW)')
     parser.add_argument('--num_epochs', type=int, default=8,
                         help='Maximum number of training epochs '
@@ -331,6 +356,11 @@ def main() -> None:
     model_args = {
         "user_int_feature_specs": user_int_feature_specs,
         "item_int_feature_specs": item_int_feature_specs,
+        "user_int_dense_map": build_user_int_dense_map(
+            pcvr_dataset.user_int_schema,
+            pcvr_dataset.user_dense_schema,
+            DEFAULT_SHARED_DENSE_FIDS,
+        ),
         "user_dense_dim": pcvr_dataset.user_dense_schema.total_dim,
         "item_dense_dim": pcvr_dataset.item_dense_schema.total_dim,
         "seq_vocab_sizes": pcvr_dataset.seq_domain_vocab_sizes,

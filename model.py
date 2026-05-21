@@ -1119,13 +1119,15 @@ class GroupNSTokenizer(nn.Module):
     def __init__(self, feature_specs: List[Tuple[int, int, int]],
                  groups: List[List[int]], emb_dim: int, d_model: int,
                  emb_skip_threshold: int = 0,
-                 sparse_embeddings: bool = False) -> None:
+                 sparse_embeddings: bool = False,
+                 dense_value_map: Optional[List[Optional[Tuple[int, int]]]] = None) -> None:
         super().__init__()
         self.feature_specs = feature_specs
         self.groups = groups
         self.emb_dim = emb_dim
         self.emb_skip_threshold = emb_skip_threshold
         self.sparse_embeddings = sparse_embeddings
+        self.dense_value_map = dense_value_map
 
         # One embedding table per fid (None if skipped by emb_skip_threshold
         # or if vocab_size <= 0 / no vocab info).
@@ -1159,7 +1161,11 @@ class GroupNSTokenizer(nn.Module):
             for group in groups
         ])
 
-    def forward(self, int_feats: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        int_feats: torch.Tensor,
+        dense_feats: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
         """Embeds and projects grouped discrete features into NS tokens.
 
         Args:
@@ -1187,8 +1193,29 @@ class GroupNSTokenizer(nn.Module):
                         vals = int_feats[:, offset:offset + length].long()  # (B, length)
                         emb_all = emb_layer(vals)  # (B, length, emb_dim)
                         mask = (vals != 0).float().unsqueeze(-1)  # (B, length, 1)
+                        dense_slice = None
+                        if (
+                            dense_feats is not None
+                            and self.dense_value_map is not None
+                            and fid_idx < len(self.dense_value_map)
+                        ):
+                            dense_info = self.dense_value_map[fid_idx]
+                            if dense_info is not None:
+                                dense_offset, dense_len = dense_info
+                                if dense_len == length:
+                                    dense_slice = dense_feats[:, dense_offset:dense_offset + dense_len]
+
                         count = mask.sum(dim=1).clamp(min=1)  # (B, 1)
-                        fid_emb = (emb_all * mask).sum(dim=1) / count  # (B, emb_dim)
+                        mean_emb = (emb_all * mask).sum(dim=1) / count  # (B, emb_dim)
+                        if dense_slice is None:
+                            fid_emb = mean_emb
+                        else:
+                            logits = dense_slice.float()
+                            logits = logits.masked_fill(mask.squeeze(-1) == 0, float("-inf"))
+                            weights = torch.softmax(logits, dim=1)
+                            weights = torch.nan_to_num(weights, nan=0.0)
+                            soft_emb = (emb_all * weights.unsqueeze(-1)).sum(dim=1)
+                            fid_emb = 0.7 * mean_emb + 0.3 * soft_emb
                 fid_embs.append(fid_emb)
             cat_emb = torch.cat(fid_embs, dim=-1)  # (B, num_fids*emb_dim)
             tokens.append(F.silu(proj(cat_emb)).unsqueeze(1))  # (B, 1, D)
@@ -1212,6 +1239,7 @@ class RankMixerNSTokenizer(nn.Module):
         num_ns_tokens: int,
         emb_skip_threshold: int = 0,
         sparse_embeddings: bool = False,
+        dense_value_map: Optional[List[Optional[Tuple[int, int]]]] = None,
     ) -> None:
         """Initializes RankMixerNSTokenizer.
 
@@ -1230,6 +1258,7 @@ class RankMixerNSTokenizer(nn.Module):
         self.num_ns_tokens = num_ns_tokens
         self.emb_skip_threshold = emb_skip_threshold
         self.sparse_embeddings = sparse_embeddings
+        self.dense_value_map = dense_value_map
 
         # One embedding table per fid (None if skipped by emb_skip_threshold
         # or if vocab_size <= 0 / no vocab info).
@@ -1278,7 +1307,11 @@ class RankMixerNSTokenizer(nn.Module):
             f"num_ns_tokens={num_ns_tokens}, pad={self._pad_size}"
         )
 
-    def forward(self, int_feats: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        int_feats: torch.Tensor,
+        dense_feats: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
         """Embeds all features, concatenates, splits, and projects.
 
         Args:
@@ -1303,8 +1336,29 @@ class RankMixerNSTokenizer(nn.Module):
                         vals = int_feats[:, offset:offset + length].long()
                         emb_all = emb_layer(vals)
                         mask = (vals != 0).float().unsqueeze(-1)
+                        dense_slice = None
+                        if (
+                            dense_feats is not None
+                            and self.dense_value_map is not None
+                            and fid_idx < len(self.dense_value_map)
+                        ):
+                            dense_info = self.dense_value_map[fid_idx]
+                            if dense_info is not None:
+                                dense_offset, dense_len = dense_info
+                                if dense_len == length:
+                                    dense_slice = dense_feats[:, dense_offset:dense_offset + dense_len]
+
                         count = mask.sum(dim=1).clamp(min=1)
-                        fid_emb = (emb_all * mask).sum(dim=1) / count
+                        mean_emb = (emb_all * mask).sum(dim=1) / count
+                        if dense_slice is None:
+                            fid_emb = mean_emb
+                        else:
+                            logits = dense_slice.float()
+                            logits = logits.masked_fill(mask.squeeze(-1) == 0, float("-inf"))
+                            weights = torch.softmax(logits, dim=1)
+                            weights = torch.nan_to_num(weights, nan=0.0)
+                            soft_emb = (emb_all * weights.unsqueeze(-1)).sum(dim=1)
+                            fid_emb = 0.7 * mean_emb + 0.3 * soft_emb
                 all_embs.append(fid_emb)
 
         cat_emb = torch.cat(all_embs, dim=-1)  # (B, total_emb_dim)
@@ -1340,6 +1394,7 @@ class PCVRHyFormer(nn.Module):
         # NS grouping config (grouped by fid index)
         user_ns_groups: List[List[int]],
         item_ns_groups: List[List[int]],
+        user_int_dense_map: Optional[List[Optional[Tuple[int, int]]]] = None,
         # Model hyperparameters
         d_model: int = 64,
         emb_dim: int = 64,
@@ -1406,6 +1461,7 @@ class PCVRHyFormer(nn.Module):
                 d_model=d_model,
                 emb_skip_threshold=emb_skip_threshold,
                 sparse_embeddings=sparse_embeddings,
+                dense_value_map=user_int_dense_map,
             )
             num_user_ns = len(user_ns_groups)
 
@@ -1433,6 +1489,7 @@ class PCVRHyFormer(nn.Module):
                 num_ns_tokens=user_ns_tokens,
                 emb_skip_threshold=emb_skip_threshold,
                 sparse_embeddings=sparse_embeddings,
+                dense_value_map=user_int_dense_map,
             )
             num_user_ns = user_ns_tokens
 
@@ -2093,7 +2150,10 @@ class PCVRHyFormer(nn.Module):
     def forward(self, inputs: ModelInput) -> torch.Tensor:
         """Runs the forward pass of the PCVRHyFormer model."""
         # 1. NS tokens: grouped projection
-        user_ns = self.user_ns_tokenizer(inputs.user_int_feats)   # (B, num_user_groups, D)
+        user_ns = self.user_ns_tokenizer(
+            inputs.user_int_feats,
+            inputs.user_dense_feats if self.has_user_dense else None,
+        )   # (B, num_user_groups, D)
         item_ns = self.item_ns_tokenizer(inputs.item_int_feats)   # (B, num_item_groups, D)
 
         ns_parts = [user_ns]
@@ -2149,7 +2209,10 @@ class PCVRHyFormer(nn.Module):
     def predict(self, inputs: ModelInput) -> Tuple[torch.Tensor, torch.Tensor]:
         """Runs inference without dropout, returning both logits and embeddings."""
         # Reuses forward logic but without dropout
-        user_ns = self.user_ns_tokenizer(inputs.user_int_feats)
+        user_ns = self.user_ns_tokenizer(
+            inputs.user_int_feats,
+            inputs.user_dense_feats if self.has_user_dense else None,
+        )
         item_ns = self.item_ns_tokenizer(inputs.item_int_feats)
 
         ns_parts = [user_ns]
